@@ -26,6 +26,7 @@ class Quaternion:
 @dataclass
 class ShapePart:
     name: str = ""
+    pivot: "Vector3" = field(default_factory=lambda: Vector3(0.0, 0.0, 0.0))
     textures: list[str] = field(default_factory=list)
 
 
@@ -159,7 +160,7 @@ def _read_shape(fp) -> Shape:
     (part_count,) = struct.unpack("<i", fp.read(4))
     for _ in range(part_count):
         part = ShapePart()
-        fp.read(12)  # pivot Vector3
+        part.pivot = _read_vector3(fp)   # local attachment offset (KO model space)
 
         # Part name
         part.name = _read_string(fp)

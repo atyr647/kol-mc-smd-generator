@@ -1,7 +1,7 @@
 """Minecraft world generator using the Anvil region file format.
 
 Generates a Minecraft Java Edition world from block data.
-Supports Minecraft 1.18+ data version (chunk format with sections at Y=-64 to 319).
+Targets Minecraft 1.21.4 (data version 4189, chunk format with sections at Y=-64 to 319).
 """
 
 import gzip
@@ -12,14 +12,15 @@ import struct
 import time
 import zlib
 from dataclasses import dataclass, field
+from typing import Optional
 
-# Minecraft data version for 1.20.4
-MC_DATA_VERSION = 3700
+# Minecraft data version for 1.21.4
+MC_DATA_VERSION = 4189
 MIN_SECTION_Y = -4  # Y=-64 in section coords
 MAX_SECTION_Y = 19   # Y=319 in section coords
 
 
-def _write_nbt_tag(buf: io.BytesIO, tag_type: int, name: str | None, value):
+def _write_nbt_tag(buf: io.BytesIO, tag_type: int, name: Optional[str], value):
     """Write an NBT tag to the buffer."""
     if name is not None:
         buf.write(struct.pack(">bH", tag_type, len(name)))
@@ -103,6 +104,10 @@ class ChunkSection:
         idx = self.palette.index(block_name)
         self.blocks[y * 256 + z * 16 + x] = idx
 
+    def has_block(self, x: int, y: int, z: int) -> bool:
+        """Return True if a non-air block exists at local coordinates (0-15)."""
+        return self.blocks[y * 256 + z * 16 + x] != 0
+
     def is_empty(self) -> bool:
         return all(b == 0 for b in self.blocks)
 
@@ -127,81 +132,108 @@ class Chunk:
         section = self.get_section(section_y)
         section.set_block(x, local_y, z, block_name)
 
+    def has_block(self, x: int, y: int, z: int) -> bool:
+        """Return True if a non-air block exists at chunk-local x,z and world y."""
+        section_y = y >> 4
+        local_y = y & 0xF
+        if section_y not in self.sections:
+            return False
+        return self.sections[section_y].has_block(x, local_y, z)
+
     def to_nbt_bytes(self) -> bytes:
-        """Serialize this chunk to NBT bytes (gzip compressed)."""
+        """Serialize this chunk to NBT bytes (uncompressed; region writer compresses)."""
         buf = io.BytesIO()
 
         # Root compound tag
-        _write_nbt_tag(buf, 10, "", None)  # TAG_Compound root
+        _write_nbt_tag(buf, 10, "", None)
 
-        # DataVersion
         _write_nbt_tag(buf, 3, "DataVersion", MC_DATA_VERSION)
-
-        # xPos, yPos, zPos
         _write_nbt_tag(buf, 3, "xPos", self.cx)
         _write_nbt_tag(buf, 3, "yPos", MIN_SECTION_Y)
         _write_nbt_tag(buf, 3, "zPos", self.cz)
-
-        # Status
-        _write_nbt_tag(buf, 8, "Status", "minecraft:full")
-
-        # LastUpdate
         _write_nbt_tag(buf, 4, "LastUpdate", 0)
+        _write_nbt_tag(buf, 4, "InhabitedTime", 0)
+        _write_nbt_tag(buf, 8, "Status", "minecraft:full")
+        # isLightOn=0 → MC recalculates sky/block light on first load (correct brightness)
+        _write_nbt_tag(buf, 1, "isLightOn", 0)
 
-        # sections list
+        # ── sections ──────────────────────────────────────────────────────────
         sections_to_write = []
         for sy in range(MIN_SECTION_Y, MAX_SECTION_Y + 1):
             if sy in self.sections and not self.sections[sy].is_empty():
                 sections_to_write.append(self.sections[sy])
             else:
-                # Write empty section
                 sections_to_write.append(ChunkSection(y=sy))
 
-        # TAG_List of TAG_Compound
         buf.write(struct.pack(">bH", 9, len("sections")))
         buf.write(b"sections")
         buf.write(struct.pack(">bi", 10, len(sections_to_write)))
 
         for section in sections_to_write:
-            # Y
             _write_nbt_tag(buf, 1, "Y", section.y)
 
-            # block_states compound
+            # block_states
             _write_nbt_tag(buf, 10, "block_states", None)
-
-            # palette
             buf.write(struct.pack(">bH", 9, len("palette")))
             buf.write(b"palette")
             buf.write(struct.pack(">bi", 10, len(section.palette)))
-
-            for block_name in section.palette:
-                _write_nbt_tag(buf, 8, "Name", block_name)
-                buf.write(b"\x00")  # End compound
-
-            # data (packed long array)
+            for block_entry in section.palette:
+                # Support "block_name[key=val,key=val]" for block states
+                if "[" in block_entry:
+                    name_part, props_str = block_entry.rstrip("]").split("[", 1)
+                    props = dict(kv.split("=") for kv in props_str.split(",") if "=" in kv)
+                else:
+                    name_part = block_entry
+                    props = {}
+                _write_nbt_tag(buf, 8, "Name", name_part)
+                if props:
+                    _write_nbt_tag(buf, 10, "Properties", None)
+                    for pk, pv in props.items():
+                        _write_nbt_tag(buf, 8, pk, pv)
+                    buf.write(b"\x00")  # end Properties
+                buf.write(b"\x00")  # end block compound
             if len(section.palette) > 1:
                 longs = _pack_block_states(section.blocks, len(section.palette))
                 _write_nbt_tag(buf, 12, "data", longs)
+            buf.write(b"\x00")  # end block_states
 
-            buf.write(b"\x00")  # End block_states compound
-
-            # biomes compound (simplified - plains everywhere)
+            # biomes — single-entry palette (plains)
             _write_nbt_tag(buf, 10, "biomes", None)
             buf.write(struct.pack(">bH", 9, len("palette")))
             buf.write(b"palette")
             buf.write(struct.pack(">bi", 8, 1))
-            encoded = "minecraft:plains".encode("utf-8")
-            buf.write(struct.pack(">H", len(encoded)))
-            buf.write(encoded)
-            buf.write(b"\x00")  # End biomes compound
+            enc = "minecraft:plains".encode("utf-8")
+            buf.write(struct.pack(">H", len(enc)))
+            buf.write(enc)
+            buf.write(b"\x00")  # end biomes
 
-            buf.write(b"\x00")  # End section compound
+            buf.write(b"\x00")  # end section compound
 
-        # Heightmaps compound (empty - MC will recalculate)
+        # ── Heightmaps (empty — MC recalculates) ──────────────────────────────
         _write_nbt_tag(buf, 10, "Heightmaps", None)
-        buf.write(b"\x00")  # End Heightmaps
+        buf.write(b"\x00")
 
-        buf.write(b"\x00")  # End root compound
+        # ── block_entities / ticks / PostProcessing (all empty) ───────────────
+        def _empty_list(name: str, elem_type: int) -> None:
+            n = name.encode("utf-8")
+            buf.write(struct.pack(">bH", 9, len(n)))
+            buf.write(n)
+            buf.write(struct.pack(">bi", elem_type, 0))
+
+        _empty_list("block_entities", 10)   # list of compounds
+        _empty_list("block_ticks",    10)   # list of compounds
+        _empty_list("fluid_ticks",    10)   # list of compounds
+        _empty_list("PostProcessing", 9)    # list of lists
+
+        # ── structures (empty References + starts) ────────────────────────────
+        _write_nbt_tag(buf, 10, "structures", None)
+        _write_nbt_tag(buf, 10, "References", None)
+        buf.write(b"\x00")
+        _write_nbt_tag(buf, 10, "starts", None)
+        buf.write(b"\x00")
+        buf.write(b"\x00")  # end structures
+
+        buf.write(b"\x00")  # end root compound
 
         return buf.getvalue()
 
@@ -222,6 +254,13 @@ class MinecraftWorld:
         if key not in self.chunks:
             self.chunks[key] = Chunk(cx, cz)
         self.chunks[key].set_block(x & 0xF, y, z & 0xF, block_name)
+
+    def has_block(self, x: int, y: int, z: int) -> bool:
+        """Return True if a non-air block exists at world coordinates."""
+        key = (x >> 4, z >> 4)
+        if key not in self.chunks:
+            return False
+        return self.chunks[key].has_block(x & 0xF, y, z & 0xF)
 
     def save(self):
         """Write all chunks to region files and create level.dat."""
@@ -292,37 +331,210 @@ class MinecraftWorld:
                 f.write(data)
 
     def _write_level_dat(self):
-        """Write a minimal level.dat file."""
+        """Write a level.dat compatible with Minecraft 1.21.4."""
         buf = io.BytesIO()
 
+        def _str(name, value):
+            _write_nbt_tag(buf, 8, name, value)
+
+        def _int(name, value):
+            _write_nbt_tag(buf, 3, name, value)
+
+        def _long(name, value):
+            _write_nbt_tag(buf, 4, name, value)
+
+        def _byte(name, value):
+            _write_nbt_tag(buf, 1, name, value)
+
+        def _float(name, value):
+            _write_nbt_tag(buf, 5, name, value)
+
+        def _double(name, value):
+            _write_nbt_tag(buf, 6, name, value)
+
+        def _compound(name):
+            _write_nbt_tag(buf, 10, name, None)
+
+        def _end():
+            buf.write(b"\x00")
+
         # Root compound
-        _write_nbt_tag(buf, 10, "", None)
+        _compound("")
 
         # Data compound
-        _write_nbt_tag(buf, 10, "Data", None)
+        _compound("Data")
 
-        _write_nbt_tag(buf, 3, "DataVersion", MC_DATA_VERSION)
-        _write_nbt_tag(buf, 8, "LevelName", self.world_name)
-        _write_nbt_tag(buf, 3, "SpawnX", 0)
-        _write_nbt_tag(buf, 3, "SpawnY", 100)
-        _write_nbt_tag(buf, 3, "SpawnZ", 0)
-        _write_nbt_tag(buf, 3, "GameType", 1)  # Creative
-        _write_nbt_tag(buf, 1, "hardcore", 0)
-        _write_nbt_tag(buf, 1, "allowCommands", 1)
-        _write_nbt_tag(buf, 3, "version", 19133)  # Anvil format
-        _write_nbt_tag(buf, 8, "generatorName", "flat")
-        _write_nbt_tag(buf, 4, "Time", 6000)
-        _write_nbt_tag(buf, 4, "LastPlayed", int(time.time() * 1000))
-        _write_nbt_tag(buf, 1, "Difficulty", 0)  # Peaceful
+        _int("DataVersion", MC_DATA_VERSION)
 
-        # WorldGenSettings
-        _write_nbt_tag(buf, 10, "WorldGenSettings", None)
-        _write_nbt_tag(buf, 4, "seed", 0)
-        _write_nbt_tag(buf, 1, "generate_features", 0)
-        buf.write(b"\x00")  # End WorldGenSettings
+        # Version compound — required by 1.21.4 to accept the world
+        _compound("Version")
+        _int("Id", MC_DATA_VERSION)
+        _str("Name", "1.21.4")
+        _str("Series", "main")
+        _byte("Snapshot", 0)
+        _end()  # end Version
 
-        buf.write(b"\x00")  # End Data compound
-        buf.write(b"\x00")  # End root compound
+        _str("LevelName", self.world_name)
+        _int("version", 19133)           # Anvil format marker
+        _byte("initialized", 1)
+        _byte("WasModded", 0)
+
+        # Spawn point
+        _int("SpawnX", 900)
+        _int("SpawnY", 70)
+        _int("SpawnZ", 550)
+        _float("SpawnAngle", 0.0)
+
+        # Game settings
+        _int("GameType", 1)              # Creative
+        _byte("hardcore", 0)
+        _byte("allowCommands", 1)
+        _byte("Difficulty", 0)          # Peaceful
+        _byte("DifficultyLocked", 0)
+        _long("Time", 6000)
+        _long("DayTime", 6000)
+        _long("LastPlayed", int(time.time() * 1000))
+        _byte("raining", 0)
+        _int("rainTime", 0)
+        _byte("thundering", 0)
+        _int("thunderTime", 0)
+
+        # World border (defaults)
+        _double("BorderCenterX", 0.0)
+        _double("BorderCenterZ", 0.0)
+        _double("BorderSize", 59999968.0)
+        _double("BorderSizeLerpTarget", 59999968.0)
+        _long("BorderSizeLerpTime", 0)
+        _double("BorderSafeZone", 5.0)
+        _double("BorderDamagePerBlock", 0.2)
+        _double("BorderWarningBlocks", 5.0)
+        _double("BorderWarningTime", 15.0)
+
+        # Wandering trader
+        _int("WanderingTraderSpawnChance", 25)
+        _int("WanderingTraderSpawnDelay", 24000)
+
+        # CustomBossEvents (empty compound)
+        _compound("CustomBossEvents")
+        _end()
+
+        # DragonFight
+        _compound("DragonFight")
+        _byte("NeedsStateScanning", 1)
+        _byte("DragonKilled", 0)
+        _byte("PreviouslyKilled", 0)
+        buf.write(struct.pack(">bH", 11, len("Gateways")))
+        buf.write(b"Gateways")
+        buf.write(struct.pack(">i", 0))  # empty int array
+        _end()
+
+        # GameRules (all defaults)
+        _compound("GameRules")
+        for name, val in [
+            ("announceAdvancements", "true"),
+            ("commandBlockOutput", "true"),
+            ("disableElytraMovementCheck", "false"),
+            ("disableRaids", "false"),
+            ("doDaylightCycle", "false"),
+            ("doEntityDrops", "true"),
+            ("doFireTick", "false"),
+            ("doImmediateRespawn", "false"),
+            ("doInsomnia", "false"),
+            ("doLimitedCrafting", "false"),
+            ("doMobLoot", "true"),
+            ("doMobSpawning", "false"),
+            ("doPatrolSpawning", "false"),
+            ("doTileDrops", "true"),
+            ("doTraderSpawning", "false"),
+            ("doWardenSpawning", "false"),
+            ("doWeatherCycle", "false"),
+            ("drowningDamage", "true"),
+            ("fallDamage", "true"),
+            ("fireDamage", "true"),
+            ("forgiveDeadPlayers", "true"),
+            ("freezeDamage", "true"),
+            ("keepInventory", "true"),
+            ("logAdminCommands", "true"),
+            ("maxCommandChainLength", "65536"),
+            ("maxEntityCramming", "24"),
+            ("mobGriefing", "false"),
+            ("naturalRegeneration", "true"),
+            ("playersSleepingPercentage", "100"),
+            ("randomTickSpeed", "3"),
+            ("reducedDebugInfo", "false"),
+            ("sendCommandFeedback", "true"),
+            ("showDeathMessages", "true"),
+            ("snowAccumulationHeight", "1"),
+            ("spawnRadius", "10"),
+            ("spectatorsGenerateChunks", "false"),
+            ("universalAnger", "false"),
+        ]:
+            _str(name, val)
+        _end()  # end GameRules
+
+        # WorldGenSettings — void overworld so MC doesn't generate terrain
+        _compound("WorldGenSettings")
+        _long("seed", 0)
+        _byte("bonus_chest", 0)
+        _byte("generate_features", 0)
+
+        _compound("dimensions")
+
+        # Overworld — flat/void (no layers = void)
+        _compound("minecraft:overworld")
+        _str("type", "minecraft:overworld")
+        _compound("generator")
+        _str("type", "minecraft:flat")
+        _compound("settings")
+        _str("biome", "minecraft:the_void")
+        _byte("features", 0)
+        _byte("lakes", 0)
+        # layers: empty list
+        buf.write(struct.pack(">bH", 9, len("layers")))
+        buf.write(b"layers")
+        buf.write(struct.pack(">bi", 10, 0))
+        _end()  # end settings
+        _end()  # end generator
+        _end()  # end minecraft:overworld
+
+        # Nether
+        _compound("minecraft:the_nether")
+        _str("type", "minecraft:the_nether")
+        _compound("generator")
+        _str("type", "minecraft:noise")
+        _str("settings", "minecraft:nether")
+        _compound("biome_source")
+        _str("type", "minecraft:multi_noise")
+        _str("preset", "minecraft:nether")
+        _end()
+        _end()  # end generator
+        _end()  # end minecraft:the_nether
+
+        # End
+        _compound("minecraft:the_end")
+        _str("type", "minecraft:the_end")
+        _compound("generator")
+        _str("type", "minecraft:noise")
+        _str("settings", "minecraft:end")
+        _compound("biome_source")
+        _str("type", "minecraft:the_end")
+        _end()
+        _end()  # end generator
+        _end()  # end minecraft:the_end
+
+        _end()  # end dimensions
+        _end()  # end WorldGenSettings
+
+        # ServerBrands (list of strings)
+        buf.write(struct.pack(">bH", 9, len("ServerBrands")))
+        buf.write(b"ServerBrands")
+        buf.write(struct.pack(">bi", 8, 1))
+        enc = "vanilla".encode("utf-8")
+        buf.write(struct.pack(">H", len(enc)))
+        buf.write(enc)
+
+        _end()  # end Data compound
+        _end()  # end root compound
 
         level_dat_path = os.path.join(self.world_dir, "level.dat")
         with gzip.open(level_dat_path, "wb") as f:
