@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>/*__TITLE__*/</title>
+<style>
+  :root { --panel: rgba(20, 22, 28, 0.82); --text: #e8e8e8; --muted: #a0a4ad; --accent: #6fb3ff; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: var(--text);
+               font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; }
+  #panel { position: absolute; top: 10px; left: 10px; width: 270px; max-height: calc(100% - 20px);
+           overflow: auto; background: var(--panel); border-radius: 8px; padding: 10px 12px; }
+  #panel h1 { font-size: 14px; margin: 0 0 6px; }
+  #panel .row { display: flex; gap: 4px; margin: 6px 0; flex-wrap: wrap; }
+  #panel button { flex: 1; background: #2c3140; color: var(--text); border: 1px solid #444b5c;
+                  border-radius: 5px; padding: 5px 6px; cursor: pointer; font: inherit; }
+  #panel button.on { background: #2f5d91; border-color: var(--accent); }
+  #panel label { display: block; margin: 3px 0; cursor: pointer; }
+  #panel .muted { color: var(--muted); font-size: 12px; }
+  #panel kbd { background: #333; border-radius: 3px; padding: 0 4px; font-size: 11px; }
+  #status { position: absolute; bottom: 10px; left: 10px; background: var(--panel); border-radius: 6px;
+            padding: 4px 8px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+             font-size: 16px; pointer-events: none; }
+  .tag { position: absolute; transform: translate(-50%, -100%); background: rgba(0, 0, 0, 0.7);
+         color: #7ff; padding: 1px 5px; border-radius: 3px; font-size: 11px; white-space: nowrap;
+         pointer-events: none; }
+  .side-label { position: absolute; top: 10px; background: var(--panel); padding: 3px 8px;
+                border-radius: 4px; font-weight: 600; pointer-events: none; }
+  #crosshair { position: absolute; left: 50%; top: 50%; width: 14px; height: 14px; margin: -7px 0 0 -7px;
+               pointer-events: none; display: none; }
+  #crosshair:before, #crosshair:after { content: ""; position: absolute; background: #fff; }
+  #crosshair:before { left: 6px; top: 0; width: 2px; height: 14px; }
+  #crosshair:after { top: 6px; left: 0; width: 14px; height: 2px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1 id="title"></h1>
+  <div class="row" id="modes"></div>
+  <div id="toggles"></div>
+  <div class="row"><button id="btnPlayer" title="Stand at the spawn point like a player">Player view</button>
+    <button id="btnTop" title="Look at the whole map from above">Overview</button></div>
+  <div class="muted" id="help">
+    <b>Mouse</b>: left-drag rotate, right-drag pan, wheel zoom.<br>
+    <kbd>F</kbd> fly mode (click to capture mouse): <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move,
+    <kbd>Space</kbd>/<kbd>Shift</kbd> up/down, <kbd>Ctrl</kbd> faster, <kbd>Esc</kbd> release.<br>
+    <kbd>1</kbd> KO &nbsp;<kbd>2</kbd> Minecraft &nbsp;<kbd>3</kbd> split screen
+  </div>
+  <div class="muted" id="info"></div>
+</div>
+<div id="status"></div>
+<div id="loading">Loading...</div>
+<div id="crosshair"></div>
+<div id="labels"></div>
+<script>window.VIEWER_DATA = "__DATA__";</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
+
+const DATA = window.VIEWER_DATA;
+const KO = DATA.ko, MC = DATA.mc;
+const $ = (id) => document.getElementById(id);
+$("title").textContent = DATA.title;
+document.title = DATA.title;
+
+// ---------------------------------------------------------------- helpers
+function b64bytes(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+const f32 = (s) => new Float32Array(b64bytes(s).buffer);
+async function inflate(bytes) {
+  const ds = new DecompressionStream("deflate");
+  const buf = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+  return buf;
+}
+const nextFrame = () => new Promise((r) => requestAnimationFrame(r));
+
+// ---------------------------------------------------------------- renderer / scenes
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const SKY = new THREE.Color(0x78a7ff);
+const KO_SKY = new THREE.Color(0x9fb8cf);
+const mcScene = new THREE.Scene();
+mcScene.background = SKY;
+mcScene.fog = new THREE.Fog(0xc4d8ff, 400, 1400);
+const koScene = new THREE.Scene();
+koScene.background = KO_SKY;
+koScene.fog = new THREE.Fog(0xb8c8d8, 400, 1400);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 6000);
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.dampingFactor = 0.12;
+orbit.screenSpacePanning = false;
+orbit.maxPolarAngle = Math.PI * 0.495;
+const fly = new PointerLockControls(camera, document.body);
+
+const size = KO ? KO.size : Math.max(MC.W, MC.D);
+const centerX = KO ? KO.size / 2 : MC.x0 + MC.W / 2;
+const centerZ = KO ? KO.size / 2 : MC.z0 + MC.D / 2;
+
+// ---------------------------------------------------------------- KO scene
+const koGroups = {};
+let koTerrain = null, koHeightAt = null;
+function buildKO() {
+  const n = KO.n, step = KO.step, S = KO.size;
+  const H = f32(KO.heights);
+  const C = b64bytes(KO.colors);
+  koHeightAt = (x, z) => {   // MC coords -> MC y
+    const fi = Math.min(Math.max(x / step, 0), n - 1.001);
+    const fj = Math.min(Math.max((S - z) / step, 0), n - 1.001);
+    const i = Math.floor(fi), j = Math.floor(fj), tx = fi - i, tz = fj - j;
+    const h = (a, b) => H[b * n + a];
+    return h(i, j) * (1 - tx) * (1 - tz) + h(i + 1, j) * tx * (1 - tz) + h(i, j + 1) * (1 - tx) * tz + h(i + 1, j + 1) * tx * tz;
+  };
+  const pos = new Float32Array(n * n * 3), col = new Float32Array(n * n * 3), uv = new Float32Array(n * n * 2);
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+    const k = j * n + i;
+    pos[k * 3] = i * step; pos[k * 3 + 1] = H[k]; pos[k * 3 + 2] = S - j * step;
+    const c = new THREE.Color(C[k * 3] / 255, C[k * 3 + 1] / 255, C[k * 3 + 2] / 255).convertSRGBToLinear();
+    col[k * 3] = c.r; col[k * 3 + 1] = c.g; col[k * 3 + 2] = c.b;
+    uv[k * 2] = i * step / 6; uv[k * 2 + 1] = j * step / 6;
+  }
+  const idx = new Uint32Array((n - 1) * (n - 1) * 6);
+  let p = 0;
+  for (let j = 0; j < n - 1; j++) for (let i = 0; i < n - 1; i++) {
+    const a = j * n + i, b = a + 1, c = a + n, d = c + 1;
+    // winding so faces point up (z is flipped)
+    idx[p++] = a; idx[p++] = b; idx[p++] = c; idx[p++] = b; idx[p++] = d; idx[p++] = c;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  g.computeVertexNormals();
+  const detail = noiseTexture();
+  koTerrain = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, map: detail, side: THREE.DoubleSide }));
+  koScene.add(koTerrain);
+
+  // water
+  const w = f32(KO.water);
+  if (w.length) {
+    const wg = new THREE.BufferGeometry();
+    wg.setAttribute("position", new THREE.BufferAttribute(w, 3));
+    wg.computeVertexNormals();
+    koGroups.water = new THREE.Mesh(wg, new THREE.MeshLambertMaterial({ color: 0x3a6fa0, transparent: true,
+      opacity: 0.72, side: THREE.DoubleSide, depthWrite: false }));
+    koScene.add(koGroups.water);
+  }
+  // collision mesh = buildings / walls
+  const cm = f32(KO.collision);
+  if (cm.length) {
+    const cg = new THREE.BufferGeometry();
+    cg.setAttribute("position", new THREE.BufferAttribute(cm, 3));
+    cg.computeVertexNormals();
+    koGroups.buildings = new THREE.Mesh(cg, new THREE.MeshLambertMaterial({ color: 0xc8bca8, side: THREE.DoubleSide,
+      flatShading: true }));
+    koScene.add(koGroups.buildings);
+  }
+  // objects
+  const P = f32(KO.objPos), Sz = f32(KO.objSize), Cat = b64bytes(KO.objCat);
+  const cats = KO.categories;
+  const bpm = KO.bpm;
+  const shapes = {
+    tree: [new THREE.ConeGeometry(0.35, 1, 7).translate(0, 0.62, 0), 0x2f6b2a, 11],
+    tree_spruce: [new THREE.ConeGeometry(0.28, 1, 7).translate(0, 0.55, 0), 0x1f4f30, 12],
+    tree_palm: [new THREE.ConeGeometry(0.4, 0.4, 6).translate(0, 0.9, 0), 0x4a8a30, 10],
+    bush: [new THREE.SphereGeometry(0.5, 8, 6).translate(0, 0.35, 0), 0x3f7f35, 1.4],
+    grass: [new THREE.ConeGeometry(0.3, 1, 4).translate(0, 0.5, 0), 0x6a9a40, 0.7],
+    flower: [new THREE.ConeGeometry(0.3, 1, 4).translate(0, 0.5, 0), 0xd070b0, 0.6],
+    sunflower: [new THREE.ConeGeometry(0.3, 1, 4).translate(0, 0.5, 0), 0xe0c030, 1.5],
+    reed: [new THREE.CylinderGeometry(0.15, 0.15, 1, 5).translate(0, 0.5, 0), 0x88a050, 2],
+    mushroom: [new THREE.SphereGeometry(0.5, 6, 4).translate(0, 0.3, 0), 0xb04030, 0.6],
+    pumpkin: [new THREE.SphereGeometry(0.5, 6, 4).translate(0, 0.4, 0), 0xd08020, 0.8],
+    rock: [new THREE.DodecahedronGeometry(0.5).translate(0, 0.2, 0), 0x86827c, 2.2],
+    lamp: [new THREE.CylinderGeometry(0.08, 0.08, 1, 5).translate(0, 0.5, 0), 0xffd860, 4],
+    fire: [new THREE.ConeGeometry(0.4, 1, 6).translate(0, 0.5, 0), 0xff7020, 1],
+    flag: [new THREE.CylinderGeometry(0.06, 0.06, 1, 5).translate(0, 0.5, 0), 0xd03030, 6],
+    fence: [new THREE.BoxGeometry(1, 1, 0.2).translate(0, 0.5, 0), 0x8a6a40, 1.2],
+    other: [new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0), 0x9a6ab0, 1.2],
+  };
+  const trunkGeo = new THREE.CylinderGeometry(0.06, 0.09, 0.3, 5).translate(0, 0.15, 0);
+  const groups = { vegetation: new THREE.Group(), objects: new THREE.Group() };
+  const m4 = new THREE.Matrix4();
+  cats.forEach((cat, ci) => {
+    const ids = [];
+    for (let i = 0; i < Cat.length; i++) if (Cat[i] === ci) ids.push(i);
+    if (!ids.length || !shapes[cat]) return;
+    const [geo, color, meters] = shapes[cat];
+    const addInst = (g, c) => {
+      const mesh = new THREE.InstancedMesh(g, new THREE.MeshLambertMaterial({ color: c }), ids.length);
+      ids.forEach((i, k) => {
+        const s = Math.max(0.5, meters * Sz[i]);
+        m4.makeScale(s, s, s).setPosition(P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
+        mesh.setMatrixAt(k, m4);
+      });
+      return mesh;
+    };
+    const veg = /tree|bush|grass|flower|reed|mushroom|pumpkin|sunflower/.test(cat);
+    const grp = veg ? groups.vegetation : groups.objects;
+    grp.add(addInst(geo, color));
+    if (cat.startsWith("tree")) grp.add(addInst(trunkGeo, 0x5a3d22));
+  });
+  koGroups.vegetation = groups.vegetation;
+  koGroups.objects = groups.objects;
+  koScene.add(groups.vegetation, groups.objects);
+  // events
+  const ev = new THREE.Group();
+  for (const e of KO.events) {
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 12, 8).translate(0, 6, 0),
+      new THREE.MeshBasicMaterial({ color: 0x40e0ff, transparent: true, opacity: 0.6 }));
+    m.position.set(...e.pos);
+    ev.add(m);
+  }
+  koGroups.events = ev;
+  koScene.add(ev);
+
+  koScene.add(new THREE.HemisphereLight(0xdfe8ff, 0x4a4030, 0.9));
+  const sun = new THREE.DirectionalLight(0xfff4e0, 1.6);
+  sun.position.set(-0.45, 0.8, -0.4);
+  koScene.add(sun);
+}
+
+function noiseTexture() {
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const ctx = c.getContext("2d");
+  const img = ctx.createImageData(64, 64);
+  for (let i = 0; i < 64 * 64; i++) {
+    const v = 215 + Math.random() * 40;
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v;
+    img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// ---------------------------------------------------------------- Minecraft scene
+// Block kinds from mc_textures.py
+const CUBE = 0, CUTOUT = 1, CROSS = 2, LIQUID = 3;
+const SOLID = 0xffff;     // "hidden solid block below the visible part of a column"
+const TILE = 32;          // columns per mesh tile
+const B = 2;              // border columns read around each tile (for culling + smooth lighting)
+// Face directions: +x, -x, +y, -y, +z, -z. Corners BL, BR, TR, TL seen from outside.
+const FACES = [
+  { n: [1, 0, 0], c: [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]], shade: 0.6 },
+  { n: [-1, 0, 0], c: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]], shade: 0.6 },
+  { n: [0, 1, 0], c: [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]], shade: 1.0 },
+  { n: [0, -1, 0], c: [[1, 0, 1], [0, 0, 1], [0, 0, 0], [1, 0, 0]], shade: 0.5 },
+  { n: [0, 0, 1], c: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], shade: 0.8 },
+  { n: [0, 0, -1], c: [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]], shade: 0.8 },
+];
+const AO_LEVEL = [0.45, 0.62, 0.8, 1.0];
+const mcGroups = { opaque: new THREE.Group(), cutout: new THREE.Group(), cross: new THREE.Group(), water: new THREE.Group() };
+let mcTop = null;   // column top y (for player view)
+
+async function buildMC(progress) {
+  const W = MC.W, D = MC.D, N = W * D;
+  const buf = await inflate(b64bytes(MC.blob));
+  const bottom = new Int16Array(buf, 0, N);
+  const len = new Uint16Array(buf, N * 2, N);
+  const runs = new Uint16Array(buf, N * 4, MC.nRuns);
+  const offs = new Uint32Array(N + 1);
+  for (let i = 0; i < N; i++) offs[i + 1] = offs[i] + len[i];
+  mcTop = (x, z) => {
+    const i = x - MC.x0, j = z - MC.z0;
+    if (i < 0 || j < 0 || i >= W || j >= D) return null;
+    const k = j * W + i;
+    return len[k] ? bottom[k] + len[k] - 1 : null;
+  };
+
+  const looks = MC.looks;
+  const nPal = looks.length;
+  const kind = new Uint8Array(nPal + 1);
+  const opaque = new Uint8Array(65536);
+  opaque[SOLID] = 1;
+  looks.forEach((l, i) => { kind[i] = l[0]; if (i > 0 && l[0] === CUBE) opaque[i] = 1; });
+
+  const tex = await new THREE.TextureLoader().loadAsync(MC.atlas);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const AW = MC.atlasW, AH = MC.atlasH, TPR = MC.tilesPerRow;
+  const tileUV = (t) => {
+    const col = t % TPR, row = Math.floor(t / TPR);
+    const e = 0.002;
+    return [(col * 16 + e) / AW, 1 - (row * 16 + 16 - e) / AH, (col * 16 + 16 - e) / AW, 1 - (row * 16 + e) / AH];
+  };
+  const uvCache = [];
+  const faceTile = (b, f) => { const l = looks[b]; return f === 2 ? l[1] : f === 3 ? l[3] : l[2]; };
+
+  const mats = {
+    opaque: new THREE.MeshBasicMaterial({ map: tex, vertexColors: true }),
+    cutout: new THREE.MeshBasicMaterial({ map: tex, vertexColors: true, alphaTest: 0.5 }),
+    cross: new THREE.MeshBasicMaterial({ map: tex, vertexColors: true, alphaTest: 0.5, side: THREE.DoubleSide }),
+    water: new THREE.MeshBasicMaterial({ map: tex, vertexColors: true, transparent: true, opacity: 0.8, depthWrite: false }),
+  };
+
+  const tilesX = Math.ceil(W / TILE), tilesZ = Math.ceil(D / TILE);
+  const total = tilesX * tilesZ;
+  let done = 0, faces = 0;
+  let lastYield = performance.now();
+
+  for (let tz = 0; tz < tilesZ; tz++) for (let tx = 0; tx < tilesX; tx++) {
+    const ix0 = tx * TILE, iz0 = tz * TILE;
+    const ix1 = Math.min(W, ix0 + TILE), iz1 = Math.min(D, iz0 + TILE);
+    // y range incl. 1-column border
+    let ymin = 1e9, ymax = -1e9;
+    for (let j = iz0 - B; j < iz1 + B; j++) for (let i = ix0 - B; i < ix1 + B; i++) {
+      if (i < 0 || j < 0 || i >= W || j >= D) continue;
+      const k = j * W + i;
+      if (!len[k]) continue;
+      if (bottom[k] < ymin) ymin = bottom[k];
+      if (bottom[k] + len[k] - 1 > ymax) ymax = bottom[k] + len[k] - 1;
+    }
+    done++;
+    if (ymax < ymin) continue;
+    ymin -= B; ymax += B;
+    const nx = ix1 - ix0 + 2 * B, nz = iz1 - iz0 + 2 * B, ny = ymax - ymin + 1;
+    const vox = new Uint16Array(nx * ny * nz);
+    // local coords: i, j = 0 is B columns outside the tile
+    const V = (i, y, j) => (i < 0 || j < 0 || y < 0 || i >= nx || j >= nz || y >= ny) ? 0 : vox[(j * nx + i) * ny + y];
+    for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) {
+      const gi = ix0 + i - B, gj = iz0 + j - B;
+      const base = (j * nx + i) * ny;
+      if (gi < 0 || gj < 0 || gi >= W || gj >= D) continue;   // outside = air
+      const k = gj * W + gi;
+      const L = len[k];
+      if (!L) continue;
+      const b0 = bottom[k] - ymin;
+      for (let y = 0; y < Math.min(b0, ny); y++) vox[base + y] = SOLID;
+      const o = offs[k];
+      for (let y = 0; y < L; y++) vox[base + b0 + y] = runs[o + y];
+    }
+    const out = { opaque: newBuf(), cutout: newBuf(), cross: newBuf(), water: newBuf() };
+    for (let j = B; j < nz - B; j++) for (let i = B; i < nx - B; i++) {
+      const gk = (iz0 + j - B) * W + (ix0 + i - B);
+      const L = len[gk];
+      if (!L) continue;
+      const y0 = bottom[gk] - ymin;
+      for (let y = y0; y < y0 + L; y++) {
+        const b = V(i, y, j);
+        if (!b || b === SOLID) continue;
+        const kd = kind[b];
+        if (kd === CROSS) {
+          emitCross(out.cross, i - B, y + ymin, j - B, faceTile(b, 4));
+          faces += 2;
+          continue;
+        }
+        const target = kd === LIQUID ? out.water : kd === CUTOUT ? out.cutout : out.opaque;
+        for (let f = 0; f < 6; f++) {
+          const F = FACES[f];
+          const nb = V(i + F.n[0], y + F.n[1], j + F.n[2]);
+          if (opaque[nb] || nb === b) continue;
+          if (kd === LIQUID && kind[nb] === LIQUID) continue;
+          let ao = [3, 3, 3, 3];
+          if (kd !== LIQUID) ao = faceAO(V, opaque, i, y, j, F);
+          const topLower = kd === LIQUID && f !== 3 && kind[V(i, y + 1, j)] !== LIQUID;
+          emitFace(target, i - B, y + ymin, j - B, F, faceTile(b, f), ao, topLower);
+          faces++;
+        }
+      }
+    }
+    for (const key of Object.keys(out)) {
+      const g = makeGeometry(out[key]);
+      if (!g) continue;
+      const mesh = new THREE.Mesh(g, mats[key]);
+      mesh.position.set(MC.x0 + ix0, 0, MC.z0 + iz0);
+      mesh.scale.set(1 / 16, 1 / 16, 1 / 16);
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
+      if (key === "water") mesh.renderOrder = 2;
+      mcGroups[key].add(mesh);
+    }
+    if (performance.now() - lastYield > 40) {
+      progress(done / total, faces);
+      await nextFrame();
+      lastYield = performance.now();
+    }
+  }
+  progress(1, faces);
+  for (const g of Object.values(mcGroups)) mcScene.add(g);
+
+  function newBuf() { return { pos: [], uv: [], col: [], n: 0 }; }
+  function uvOf(t) { return uvCache[t] || (uvCache[t] = tileUV(t)); }
+  function emitFace(o, x, y, z, F, t, ao, lower) {
+    const [u0, v0, u1, v1] = uvOf(t);
+    const uvs = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+    const order = ao[0] + ao[2] < ao[1] + ao[3] ? [1, 2, 3, 0] : [0, 1, 2, 3];
+    for (const q of order) {
+      const c = F.c[q];
+      let cy = c[1] * 16;
+      if (lower && c[1] === 1) cy = 14;
+      o.pos.push(x * 16 + c[0] * 16, y * 16 + cy, z * 16 + c[2] * 16);
+      o.uv.push(uvs[q][0], uvs[q][1]);
+      const s = Math.round(255 * F.shade * AO_LEVEL[ao[q]]);
+      o.col.push(s, s, s);
+    }
+    o.n++;
+  }
+  function emitCross(o, x, y, z, t) {
+    const [u0, v0, u1, v1] = uvOf(t);
+    const quads = [[[2, 2], [14, 14]], [[2, 14], [14, 2]]];
+    for (const [[ax, az], [bx, bz]] of quads) {
+      const pts = [[ax, 0, az], [bx, 0, bz], [bx, 16, bz], [ax, 16, az]];
+      const uvs = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+      for (let q = 0; q < 4; q++) {
+        o.pos.push(x * 16 + pts[q][0], y * 16 + pts[q][1], z * 16 + pts[q][2]);
+        o.uv.push(uvs[q][0], uvs[q][1]);
+        o.col.push(230, 230, 230);
+      }
+      o.n++;
+    }
+  }
+  function makeGeometry(o) {
+    if (!o.n) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Int16Array(o.pos), 3));
+    g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(o.uv), 2));
+    g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(o.col), 3, true));
+    const idx = new Uint32Array(o.n * 6);
+    for (let q = 0; q < o.n; q++) {
+      const a = q * 4;
+      idx.set([a, a + 1, a + 2, a, a + 2, a + 3], q * 6);
+    }
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    g.computeBoundingSphere();
+    return g;
+  }
+}
+
+function faceAO(V, opaque, i, y, j, F) {
+  // Minecraft-style smooth lighting: darken corners next to solid blocks.
+  const n = F.n;
+  const out = [3, 3, 3, 3];
+  const axes = n[0] ? [1, 2] : n[1] ? [0, 2] : [0, 1];
+  for (let q = 0; q < 4; q++) {
+    const c = F.c[q];
+    const p = [i + n[0], y + n[1], j + n[2]];
+    const d1 = [0, 0, 0], d2 = [0, 0, 0];
+    d1[axes[0]] = c[axes[0]] ? 1 : -1;
+    d2[axes[1]] = c[axes[1]] ? 1 : -1;
+    const s1 = opaque[V(p[0] + d1[0], p[1] + d1[1], p[2] + d1[2])];
+    const s2 = opaque[V(p[0] + d2[0], p[1] + d2[1], p[2] + d2[2])];
+    const cn = opaque[V(p[0] + d1[0] + d2[0], p[1] + d1[1] + d2[1], p[2] + d1[2] + d2[2])];
+    out[q] = s1 && s2 ? 0 : 3 - (s1 + s2 + cn);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- UI
+let mode = MC ? "mc" : "ko";
+const modes = [];
+if (KO) modes.push(["ko", "Knight Online"]);
+if (MC) modes.push(["mc", "Minecraft"]);
+if (KO && MC) modes.push(["split", "Split"]);
+for (const [m, label] of modes) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.dataset.mode = m;
+  b.onclick = () => setMode(m);
+  $("modes").appendChild(b);
+}
+function setMode(m) {
+  if (!modes.find((x) => x[0] === m)) return;
+  mode = m;
+  for (const b of $("modes").children) b.classList.toggle("on", b.dataset.mode === m);
+  labelsDirty = true;
+}
+
+const toggles = [];
+function addToggle(label, get, set, def = true) {
+  const l = document.createElement("label");
+  const c = document.createElement("input");
+  c.type = "checkbox";
+  c.checked = def;
+  c.onchange = () => set(c.checked);
+  l.append(c, " " + label);
+  $("toggles").appendChild(l);
+  set(def);
+}
+
+let koWire = null;
+let fogOn = true;
+let labelsOn = true;
+let labelsDirty = true;
+
+// ---------------------------------------------------------------- camera helpers
+function overview() {
+  if (fly.isLocked) fly.unlock();
+  const cy = KO ? koHeightAt(centerX, centerZ) : 80;
+  orbit.target.set(centerX, cy, centerZ);
+  camera.position.set(centerX - size * 0.15, cy + size * 0.55, centerZ + size * 0.6);
+  orbit.update();
+}
+function playerView() {
+  let sx, sy, sz;
+  if (MC) [sx, sy, sz] = MC.spawn; else { sx = centerX; sz = centerZ; sy = koHeightAt(sx, sz) + 1; }
+  const top = MC && mcTop ? mcTop(Math.floor(sx), Math.floor(sz)) : null;
+  const ground = top !== null ? top + 1 : sy;
+  camera.position.set(sx + 0.5, ground + 1.62, sz + 0.5);
+  orbit.target.set(sx + 0.5, ground + 1.62, sz - 8);
+  orbit.update();
+}
+$("btnTop").onclick = overview;
+$("btnPlayer").onclick = playerView;
+
+// fly mode
+const keys = {};
+addEventListener("keydown", (e) => {
+  keys[e.code] = true;
+  if (e.code === "KeyF") { if (fly.isLocked) fly.unlock(); else fly.lock(); }
+  if (e.code === "Digit1") setMode("ko");
+  if (e.code === "Digit2") setMode("mc");
+  if (e.code === "Digit3") setMode("split");
+  if (fly.isLocked && ["Space", "ShiftLeft", "ControlLeft"].includes(e.code)) e.preventDefault();
+});
+addEventListener("keyup", (e) => { keys[e.code] = false; });
+fly.addEventListener("lock", () => { orbit.enabled = false; $("crosshair").style.display = "block"; });
+fly.addEventListener("unlock", () => {
+  orbit.enabled = true;
+  $("crosshair").style.display = "none";
+  const d = new THREE.Vector3();
+  camera.getWorldDirection(d);
+  orbit.target.copy(camera.position).addScaledVector(d, 10);
+});
+
+addEventListener("resize", () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  labelsDirty = true;
+});
+
+// ---------------------------------------------------------------- labels
+const labelEls = [];
+function updateLabels(vpX, vpW, show) {
+  if (!KO || !KO.events.length) return;
+  if (!labelEls.length) {
+    for (const e of KO.events) {
+      const d = document.createElement("div");
+      d.className = "tag";
+      d.textContent = e.type;
+      d.title = e.name;
+      $("labels").appendChild(d);
+      labelEls.push(d);
+    }
+  }
+  const v = new THREE.Vector3();
+  KO.events.forEach((e, i) => {
+    v.set(e.pos[0], e.pos[1] + 13, e.pos[2]).project(camera);
+    const ok = show && labelsOn && v.z < 1 && Math.abs(v.x) < 1 && Math.abs(v.y) < 1;
+    const el = labelEls[i];
+    el.style.display = ok ? "block" : "none";
+    if (ok) {
+      el.style.left = (vpX + (v.x + 1) / 2 * vpW) + "px";
+      el.style.top = ((1 - v.y) / 2 * window.innerHeight) + "px";
+    }
+  });
+}
+
+// ---------------------------------------------------------------- main loop
+const clock = new THREE.Clock();
+const sideLabels = [document.createElement("div"), document.createElement("div")];
+sideLabels.forEach((d) => { d.className = "side-label"; d.style.display = "none"; document.body.appendChild(d); });
+sideLabels[0].textContent = "Knight Online";
+sideLabels[1].textContent = "Minecraft";
+
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (fly.isLocked) {
+    const speed = (keys.ControlLeft || keys.ControlRight ? 60 : 11) * dt;
+    const fwd = new THREE.Vector3();
+    camera.getWorldDirection(fwd);
+    fwd.y = 0; fwd.normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, camera.up).normalize();
+    if (keys.KeyW) camera.position.addScaledVector(fwd, speed);
+    if (keys.KeyS) camera.position.addScaledVector(fwd, -speed);
+    if (keys.KeyD) camera.position.addScaledVector(right, speed);
+    if (keys.KeyA) camera.position.addScaledVector(right, -speed);
+    if (keys.Space) camera.position.y += speed;
+    if (keys.ShiftLeft || keys.ShiftRight) camera.position.y -= speed;
+  } else {
+    orbit.update();
+  }
+  const W = window.innerWidth, H = window.innerHeight;
+  mcScene.fog.far = koScene.fog.far = fogOn ? Math.max(800, camera.position.y * 4) : 1e6;
+  mcScene.fog.near = koScene.fog.near = fogOn ? mcScene.fog.far * 0.35 : 1e6;
+  if (mode === "split") {
+    renderer.setScissorTest(true);
+    camera.aspect = (W / 2) / H;
+    camera.updateProjectionMatrix();
+    renderer.setViewport(0, 0, W / 2, H); renderer.setScissor(0, 0, W / 2, H);
+    renderer.render(koScene, camera);
+    renderer.setViewport(W / 2, 0, W / 2, H); renderer.setScissor(W / 2, 0, W / 2, H);
+    renderer.render(mcScene, camera);
+    renderer.setScissorTest(false);
+    sideLabels[0].style.display = sideLabels[1].style.display = "block";
+    sideLabels[0].style.left = (W / 4 - 40) + "px";
+    sideLabels[1].style.left = (W * 3 / 4 - 30) + "px";
+    updateLabels(0, W / 2, true);
+  } else {
+    camera.aspect = W / H;
+    camera.updateProjectionMatrix();
+    renderer.setViewport(0, 0, W, H);
+    renderer.render(mode === "ko" ? koScene : mcScene, camera);
+    sideLabels[0].style.display = sideLabels[1].style.display = "none";
+    updateLabels(0, W, mode === "ko");
+  }
+  const p = camera.position;
+  let s = `Minecraft  x ${Math.floor(p.x)}  y ${Math.floor(p.y - 1.62)}  z ${Math.floor(p.z)}`;
+  if (KO) {
+    const c = KO.coords;
+    const kx = p.x / KO.bpm, kz = c.map_size_m - p.z / KO.bpm;
+    s += `   |   KO  x ${kx.toFixed(0)}  z ${kz.toFixed(0)} m`;
+  }
+  $("status").textContent = s;
+  requestAnimationFrame(frame);
+}
+
+// ---------------------------------------------------------------- start
+(async function start() {
+  try {
+    if (KO) buildKO();
+    if (KO) {
+      addToggle("KO buildings / walls (collision mesh)", null, (v) => koGroups.buildings && (koGroups.buildings.visible = v));
+      addToggle("KO trees & plants", null, (v) => koGroups.vegetation && (koGroups.vegetation.visible = v));
+      addToggle("KO other objects", null, (v) => koGroups.objects && (koGroups.objects.visible = v));
+      addToggle("KO water", null, (v) => koGroups.water && (koGroups.water.visible = v));
+      addToggle("Event labels", null, (v) => { labelsOn = v; if (koGroups.events) koGroups.events.visible = v; });
+    }
+    if (MC) {
+      addToggle("Minecraft plants (cross blocks)", null, (v) => mcGroups.cross.visible = v);
+      addToggle("Minecraft water", null, (v) => mcGroups.water.visible = v);
+    }
+    if (KO && MC) {
+      addToggle("KO terrain wireframe over Minecraft", null, (v) => {
+        if (v && !koWire) {
+          koWire = new THREE.Mesh(koTerrain.geometry, new THREE.MeshBasicMaterial({ color: 0xff3030, wireframe: true,
+            transparent: true, opacity: 0.35 }));
+          mcScene.add(koWire);
+        }
+        if (koWire) koWire.visible = v;
+      }, false);
+    }
+    addToggle("Fog", null, (v) => { fogOn = v; });
+    setMode(mode);
+    overview();
+    requestAnimationFrame(frame);
+    if (MC) {
+      $("info").innerHTML = MC.textured ? "Textures: from your Minecraft jar." :
+        "Textures: plain colours. Re-run the preview with <kbd>--download-textures</kbd> or <kbd>--mc-jar</kbd> to see real Minecraft textures.";
+      await buildMC((f, faces) => { $("loading").textContent = `Building Minecraft blocks... ${Math.round(f * 100)}%`; });
+      $("info").innerHTML += `<br>${MC.W}x${MC.D} columns, x ${MC.x0}..${MC.x0 + MC.W - 1}, z ${MC.z0}..${MC.z0 + MC.D - 1}`;
+    }
+    $("loading").style.display = "none";
+    window.VIEWER_READY = true;
+  } catch (err) {
+    $("loading").textContent = "Error: " + err.message;
+    console.error(err);
+    window.VIEWER_ERROR = String(err);
+  }
+})();
+</script>
+</body>
+</html>

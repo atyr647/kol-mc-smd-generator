@@ -414,3 +414,7 @@ healthchecksdb
 MigrationBackup/
 
 # End of https://www.gitignore.io/api/c++,cmake,visualstudio,visualstudiocode
+
+# ko2mc generated worlds and previews
+/output/
+/preview/
