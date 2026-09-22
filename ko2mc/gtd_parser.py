@@ -76,6 +76,7 @@ class GTDFile:
     tex2: np.ndarray | None = None          # [x, z] blend texture index (1023 = none)
     tile_textures: list[str] = field(default_factory=list)  # tile texture index -> source name
     tile_subindex: list[int] = field(default_factory=list)  # tile texture index -> index in .gtt
+    tile_files: list[str] = field(default_factory=list)     # tile texture index -> .gtt file name
     water: list[WaterMesh] = field(default_factory=list)
 
     @property
@@ -223,14 +224,17 @@ def parse_gtd(filepath: str, verbose: bool = True) -> GTDFile:
         off += n * n                          # grass attributes
         off += MAX_PATH                       # grass file name
         num_tex, num_src = read("<ii")
-        sources = []
+        sources, files = [], []
         for _ in range(num_src):
-            sources.append(_clean_texture_name(data[off:off + MAX_PATH]))
+            raw = data[off:off + MAX_PATH]
+            sources.append(_clean_texture_name(raw))
+            files.append(raw.split(b"\x00")[0].decode("latin-1").replace("\\", "/").rsplit("/", 1)[-1])
             off += MAX_PATH
         pairs = np.frombuffer(data, dtype="<i2", count=num_tex * 2, offset=off).reshape(-1, 2)
         off += num_tex * 4
         gtd.tile_textures = [sources[s] if 0 <= s < len(sources) else "" for s, _ in pairs]
         gtd.tile_subindex = [int(t) for _, t in pairs]
+        gtd.tile_files = [files[s] if 0 <= s < len(files) else "" for s, _ in pairs]
         gtd.water = _find_water(data[off:], gtd.size_meters)
     except (struct.error, ValueError, IndexError) as e:
         if verbose:

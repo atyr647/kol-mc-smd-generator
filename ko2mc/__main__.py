@@ -43,6 +43,12 @@ def main():
                         help="Don't build walls/buildings from the collision mesh")
     parser.add_argument("--texture-map", default=None,
                         help="JSON file with extra texture-name -> block rules")
+    parser.add_argument("--ko-textures", default=None, metavar="DIR",
+                        help="Folder with KO .gtt terrain textures (client Data/dtex); "
+                             "makes a resource pack with the real KO ground textures "
+                             "(default: ./dtex if it exists)")
+    parser.add_argument("--pack-resolution", type=int, default=64, choices=[16, 32, 64, 128, 256],
+                        help="Pixels per block texture in the resource pack (default 64)")
     parser.add_argument("--preview", action="store_true",
                         help="Also render the KO reference and Minecraft previews")
 
@@ -51,6 +57,14 @@ def main():
     if not os.path.exists(args.gtd_file):
         print(f"Error: GTD file not found: {args.gtd_file}", file=sys.stderr)
         sys.exit(1)
+
+    if args.ko_textures is None:
+        # Use a dtex/ folder next to gtd/ automatically (where the .gtt files go)
+        guess = os.path.join(os.path.dirname(os.path.abspath(args.gtd_file)), "..", "dtex")
+        for folder in (guess, "dtex"):
+            if os.path.isdir(folder) and any(f.lower().endswith(".gtt") for f in os.listdir(folder)):
+                args.ko_textures = os.path.normpath(folder)
+                break
 
     if args.texture_map:
         materials.load_texture_map(args.texture_map)
@@ -78,6 +92,8 @@ def main():
         vertical_scale=args.vertical_scale,
         objects=not args.no_objects,
         buildings=not args.no_buildings,
+        ko_textures=args.ko_textures,
+        pack_resolution=args.pack_resolution,
     )
 
     if args.preview:

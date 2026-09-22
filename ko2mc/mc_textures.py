@@ -140,10 +140,31 @@ def download_client_jar(dest: str) -> str | None:
         return None
 
 
-class _JarModels:
-    """Resolves block state -> textures using the jar's blockstates/models JSON."""
+def _asset(ref: str, kind: str, ext: str) -> str:
+    """'ko2mc:block/t0' -> 'assets/ko2mc/<kind>/block/t0.<ext>' (default namespace minecraft)."""
+    ns, _, path = ref.rpartition(":")
+    return f"assets/{ns or 'minecraft'}/{kind}/{path}.{ext}"
 
-    def __init__(self, zf: zipfile.ZipFile):
+
+class _Zips:
+    """Files looked up in resource packs first, then the Minecraft jar."""
+
+    def __init__(self, paths):
+        self.zips = [zipfile.ZipFile(p) for p in paths if p]
+
+    def read(self, name):
+        for z in self.zips:
+            try:
+                return z.read(name)
+            except KeyError:
+                pass
+        raise KeyError(name)
+
+
+class _JarModels:
+    """Resolves block state -> textures using blockstates/models JSON."""
+
+    def __init__(self, zf: "_Zips"):
         self.zf = zf
         self._models = {}
 
@@ -154,10 +175,10 @@ class _JarModels:
             return None
 
     def model(self, ref: str) -> dict:
-        ref = ref.removeprefix("minecraft:")
+        ref = ref if ":" in ref else "minecraft:" + ref
         if ref in self._models:
             return self._models[ref]
-        m = self._json(f"assets/minecraft/models/{ref}.json") or {}
+        m = self._json(_asset(ref, "models", "json")) or {}
         textures, parents = {}, []
         cur = m
         while cur:
@@ -165,7 +186,7 @@ class _JarModels:
             for k, v in cur.get("textures", {}).items():
                 textures.setdefault(k, v)
             p = cur.get("parent")
-            cur = self._json(f"assets/minecraft/models/{p.removeprefix('minecraft:')}.json") if p else None
+            cur = self._json(_asset(p if ":" in p else "minecraft:" + p, "models", "json")) if p else None
         # resolve '#refs'
         for _ in range(5):
             for k, v in list(textures.items()):
@@ -176,7 +197,7 @@ class _JarModels:
         return result
 
     def state_model(self, name: str, props: dict) -> dict:
-        bs = self._json(f"assets/minecraft/blockstates/{name}.json")
+        bs = self._json(_asset("minecraft:" + name, "blockstates", "json"))
         if not bs:
             return {"textures": {}, "parents": []}
         if "variants" in bs:
@@ -199,7 +220,9 @@ class _JarModels:
 
 
 def _tex_name(ref: str) -> str:
-    return ref.removeprefix("minecraft:").removeprefix("block/")
+    """Short name for vanilla block textures ('stone'), full 'ns:path' for others."""
+    ref = str(ref).removeprefix("minecraft:")
+    return ref.removeprefix("block/") if ":" not in ref else ref
 
 
 def _kind_for(name: str, parents: list[str]) -> int:
@@ -213,11 +236,16 @@ def _kind_for(name: str, parents: list[str]) -> int:
     return CUBE
 
 
-def build_appearance(palette: list[str], jar_path: str | None) -> BlockAppearance:
-    """Create the atlas and per-block looks for a world palette."""
+def build_appearance(palette: list[str], jar_path: str | None,
+                     pack_paths: list[str] | None = None) -> BlockAppearance:
+    """Create the atlas and per-block looks for a world palette.
+
+    pack_paths: resource packs (e.g. the KO texture pack) that override the jar.
+    """
     from PIL import Image
 
-    zf = zipfile.ZipFile(jar_path) if jar_path else None
+    paths = [p for p in (pack_paths or []) if p and os.path.exists(p)] + ([jar_path] if jar_path else [])
+    zf = _Zips(paths) if paths else None
     models = _JarModels(zf) if zf else None
     tiles: dict[str, int] = {}
     images: list[np.ndarray] = []
@@ -229,9 +257,11 @@ def build_appearance(palette: list[str], jar_path: str | None) -> BlockAppearanc
         img = None
         if zf:
             try:
-                raw = zf.read(f"assets/minecraft/textures/block/{tex}.png")
+                ref = tex if ":" in tex else f"minecraft:block/{tex}"
+                raw = zf.read(_asset(ref, "textures", "png"))
                 im = Image.open(io.BytesIO(raw)).convert("RGBA")
-                img = np.array(im.crop((0, 0, im.width, im.width)).resize((TILE, TILE), Image.NEAREST))
+                im = im.crop((0, 0, im.width, im.width))
+                img = np.array(im.resize((TILE, TILE), Image.BOX if im.width > TILE else Image.NEAREST))
             except KeyError:
                 img = None
         if img is None:
@@ -241,7 +271,7 @@ def build_appearance(palette: list[str], jar_path: str | None) -> BlockAppearanc
                     GRASS_TINT if tex in ("grass_block_top", "grass_block_side_overlay", "short_grass",
                                           "fern", "tall_grass_top", "tall_grass_bottom", "sugar_cane")
                     else FIXED_FOLIAGE.get(tex, FOLIAGE_TINT))
-            if zf or tex.startswith("water"):
+            if jar_path or tex.startswith("water"):
                 img = img.copy()
                 img[..., :3] = (img[..., :3].astype(np.float32) * np.array(tint) / 255).astype(np.uint8)
         tiles[tex] = len(images)
@@ -278,7 +308,7 @@ def build_appearance(palette: list[str], jar_path: str | None) -> BlockAppearanc
             side = pick("side", "all", "north", "texture", "wall", "particle", default=_guess_side(short))
             bottom = pick("bottom", "end", "all", "down", "texture", "particle", default=_guess_top(short))
         t, s, b = tile_for(top), tile_for(side), tile_for(bottom)
-        if short == "grass_block" and zf:
+        if short == "grass_block" and jar_path:
             s = _grass_side(zf, tiles, images, tile_for)
         img = images[t]
         alpha = img[..., 3:4].astype(np.float32) / 255
@@ -291,8 +321,8 @@ def build_appearance(palette: list[str], jar_path: str | None) -> BlockAppearanc
     for i, im in enumerate(images):
         r, c = divmod(i, per_row)
         atlas[r * TILE:(r + 1) * TILE, c * TILE:(c + 1) * TILE] = im
-    return BlockAppearance(atlas, per_row, looks, textured=zf is not None,
-                           source=os.path.basename(jar_path) if jar_path else "built-in colours")
+    return BlockAppearance(atlas, per_row, looks, textured=jar_path is not None,
+                           source=", ".join(os.path.basename(p) for p in paths) or "built-in colours")
 
 
 def _grass_side(zf, tiles, images, tile_for) -> int:

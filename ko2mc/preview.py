@@ -383,7 +383,12 @@ class MCScene:
                 pos += b - a
         self.run_values = values
         self.palette = list(self.reader.palette)
-        self.look = build_appearance(self.palette, self.jar)
+        pack = self.info.get("resource_pack")
+        if pack and not os.path.isabs(pack):
+            pack = os.path.join(self.world_dir, pack)
+        if not pack or not os.path.exists(pack):
+            pack = os.path.join(self.world_dir, "resources.zip")
+        self.look = build_appearance(self.palette, self.jar, [pack])
 
     def _opaque_lut(self):
         from .mc_textures import _kind_for, _split_state

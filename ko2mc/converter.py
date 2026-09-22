@@ -125,7 +125,7 @@ def _bilinear(grid: np.ndarray, fx: np.ndarray, fz: np.ndarray) -> np.ndarray:
 class TerrainModel:
     """Per-column terrain data on the Minecraft grid, indexed [mc_z, mc_x]."""
 
-    def __init__(self, gtd: GTDFile, cm: CoordMap, world: MinecraftWorld):
+    def __init__(self, gtd: GTDFile, cm: CoordMap, world: MinecraftWorld, texture_pack=None, library=None):
         self.cm = cm
         size = cm.size_blocks
         s = cm.scale
@@ -144,6 +144,13 @@ class TerrainModel:
         tz = np.clip(np.floor(FZ).astype(np.int32), 0, n - 1)
         self.material = mat_grid[tx, tz]
         self.material_names = names
+        self.tex = gtd.tex1[tx, tz]
+
+        # KO textures via the resource pack: tile texture index -> note block state
+        self.custom_ids = np.zeros(1024, dtype=np.uint16)     # 0 = use the material block
+        self.custom_below = np.zeros(1024, dtype=np.uint16)
+        if texture_pack is not None and library is not None:
+            self._assign_textures(gtd, world, texture_pack, library)
 
         # Water level (top water block y) per column, or MIN_Y if none
         self.water_top = np.full((size, size), MIN_Y, dtype=np.int32)
@@ -160,6 +167,30 @@ class TerrainModel:
         self.deep_ids = np.array([world.block_id(m.deep) for m in mats], dtype=np.uint16)
         self.bedrock = world.block_id("minecraft:bedrock")
         self.water = world.block_id(materials.WATER_BLOCK)
+
+    def _assign_textures(self, gtd, world, pack, library):
+        from .ko_textures import custom_state, tile_texture_key
+        used, counts = np.unique(self.tex, return_counts=True)
+        order = np.argsort(-counts)        # most common first, in case we run out of states
+        missing = set()
+        for idx in used[order]:
+            key = tile_texture_key(gtd, int(idx))
+            if key is None:
+                continue
+            rgba = library.tile(*key)
+            if rgba is None:
+                missing.add(key[0] if library.textures_in(key[0]) is None else f"{key[0]} #{key[1]}")
+                continue
+            slot = pack.add(rgba, f"{key[0]} #{key[1]}")
+            if slot is None:
+                print("  Note: more KO textures than available note block states; rest use normal blocks")
+                break
+            state, below = custom_state(slot)
+            self.custom_ids[idx] = world.block_id(state)
+            self.custom_below[idx] = world.block_id(below)
+        print(f"  KO textures: {len(pack.images)} of {len(used)} used tile textures found")
+        if missing:
+            print(f"  Missing: {', '.join(sorted(missing)[:12])}{' ...' if len(missing) > 12 else ''}")
 
     def _rasterize_water(self, tris_ko: np.ndarray):
         cm = self.cm
@@ -201,8 +232,12 @@ class TerrainModel:
         ys = (np.arange(out.shape[0]) + MIN_Y)[:, None, None]
         view = out[:, za - z0:zb - z0, xa - x0:xb - x0]
         surface = np.where(wet, self.wet_surface_ids[mat], self.surface_ids[mat])
-        view[:] = np.where(ys < top - 3, self.deep_ids[mat],
-                           np.where(ys < top, self.sub_ids[mat], surface))
+        tex = self.tex[za:zb, xa:xb]
+        custom = self.custom_ids[tex]
+        surface = np.where(custom > 0, custom, surface)
+        sub = np.where(ys == top - 1, np.where(custom > 0, self.custom_below[tex], self.sub_ids[mat]),
+                       self.sub_ids[mat])
+        view[:] = np.where(ys < top - 3, self.deep_ids[mat], np.where(ys < top, sub, surface))
         view[ys > top] = 0
         water = (ys > top) & (ys <= wtop)
         view[water] = self.water
@@ -526,7 +561,8 @@ def voxelize_collision(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorl
 def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 world_name: str = "KnightOnline", scale: int = 4,
                 vertical_scale: float | None = None, objects: bool = True,
-                buildings: bool = True) -> str:
+                buildings: bool = True, ko_textures: str | None = None,
+                pack_resolution: int = 64) -> str:
     """Convert KO map files to a Minecraft world.
 
     Args:
@@ -538,6 +574,9 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         vertical_scale: MC blocks per KO meter vertically (default: same as horizontal).
         objects: Place trees, rocks, lamps, event markers etc.
         buildings: Voxelize the collision mesh (buildings, walls, bridges).
+        ko_textures: Folder with the KO client's .gtt terrain textures (Data/dtex).
+            If given, a resource pack with the real KO ground textures is made.
+        pack_resolution: Pixel size of each block texture in the resource pack.
 
     Returns:
         Path to the generated world directory.
@@ -564,7 +603,12 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
 
     print(f"\nBuilding terrain ({size}x{size} blocks, scale={scale}, "
           f"vertical {cm.vertical_scale:.3f} blocks/m)...")
-    terrain = TerrainModel(gtd, cm, world)
+    pack = library = None
+    if ko_textures:
+        from .ko_textures import TexturePack, TextureLibrary
+        library = TextureLibrary(ko_textures)
+        pack = TexturePack(world_name, pack_resolution)
+    terrain = TerrainModel(gtd, cm, world, pack, library)
     world.set_terrain(terrain.fill_chunk, (0, 0, size - 1, size - 1))
     water_cols = int((terrain.water_top > terrain.top).sum())
     print(f"  Surface Y range {terrain.top.min()}..{terrain.top.max()}, {water_cols} water columns")
@@ -592,6 +636,13 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     print("\nSaving Minecraft world...")
     world.save()
 
+    pack_path = None
+    if pack is not None and pack.images:
+        # resources.zip inside a world folder is applied automatically in singleplayer
+        pack_path = os.path.join(world_dir, "resources.zip")
+        pack.write(pack_path)
+        pack.write(os.path.join(output_dir, f"{world_name}_KO_textures.zip"))
+
     info = {
         "tool": "ko2mc",
         "gtd": os.path.abspath(gtd_path),
@@ -599,6 +650,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         "coords": cm.to_json(),
         "size_blocks": size,
         "spawn": world.spawn,
+        "resource_pack": "resources.zip" if pack_path else None,
     }
     with open(os.path.join(world_dir, "ko2mc.json"), "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
@@ -616,6 +668,9 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     print(f"  Spawn: {world.spawn}")
     print(f"  KO (x, z) -> MC: x = x_ko * {cm.blocks_per_meter:g}, "
           f"z = ({cm.map_size_m:g} - z_ko) * {cm.blocks_per_meter:g}")
+    if pack_path:
+        print(f"  KO textures: resource pack inside the world (resources.zip); a copy for your")
+        print(f"  resourcepacks folder is {os.path.join(output_dir, world_name + '_KO_textures.zip')}")
     print(f"\nTo use: Copy '{world_name}' folder to your Minecraft saves directory.")
     print("  Windows: %appdata%/.minecraft/saves/")
     print("  Linux:   ~/.minecraft/saves/")
