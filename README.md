@@ -47,6 +47,7 @@ python -m ko2mc --preview gtd/moradon.gtd
 | `--no-buildings` | Don't build walls/buildings from the collision mesh |
 | `--ko-textures DIR` | Folder with KO `.gtt` files (default: `dtex/` if it has any) |
 | `--pack-resolution` | Pixels per block in the texture pack (default 64) |
+| `--pack-brightness` | Brightness multiplier for KO textures (default 1.6) |
 | `--texture-map FILE` | JSON of extra `"texture regex": "block"` rules |
 | `--preview` | Also render the previews |
 
@@ -60,7 +61,15 @@ The converter prints where warp gates and bind points ended up, and how KO coord
 
 ## Real KO ground textures (resource pack)
 
-Put the `.gtt` files from your KO client's `Data/dtex` folder into `dtex/` (see `dtex/README.md`) and convert again. You get:
+Put the `.gtt` files from your KO client's `Data/dtex` folder into `dtex/` (see `dtex/README.md`), or point `--ko-textures` at a folder that has them, and convert again. For example, with the `Knight-Online-Minecraft-Conversion-Plugin-Directory` repo cloned next to this one:
+
+```bash
+python -m ko2mc gtd/moradon.gtd --ko-textures "../knight-online-minecraft-conversion-plugin-directory/additions/USKO Moradon Patch (v1298)/Client/DTex"
+```
+
+That folder covers 43 of the 48 maps here. `In_dungeon06`, `dungeon_a`, `dungeon_defense`, `eslantzone` and `war_a` also use newer (2013–2017) textures; tiles whose file is missing keep a normal Minecraft block. Use `--pack-brightness` (default 1.6) if the ground looks too dark or too bright.
+
+You get:
 
 - `output/KO_Moradon/resources.zip`: Minecraft applies it automatically when you open that world in singleplayer.
 - `output/KO_Moradon_KO_textures.zip`: a copy for your `resourcepacks` folder (for servers or other setups).

@@ -562,7 +562,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 world_name: str = "KnightOnline", scale: int = 4,
                 vertical_scale: float | None = None, objects: bool = True,
                 buildings: bool = True, ko_textures: str | None = None,
-                pack_resolution: int = 64) -> str:
+                pack_resolution: int = 64, pack_brightness: float = 1.6) -> str:
     """Convert KO map files to a Minecraft world.
 
     Args:
@@ -577,6 +577,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         ko_textures: Folder with the KO client's .gtt terrain textures (Data/dtex).
             If given, a resource pack with the real KO ground textures is made.
         pack_resolution: Pixel size of each block texture in the resource pack.
+        pack_brightness: Multiplier for KO texture colours (KO draws terrain brighter than stored).
 
     Returns:
         Path to the generated world directory.
@@ -607,7 +608,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     if ko_textures:
         from .ko_textures import TexturePack, TextureLibrary
         library = TextureLibrary(ko_textures)
-        pack = TexturePack(world_name, pack_resolution)
+        pack = TexturePack(world_name, pack_resolution, pack_brightness)
     terrain = TerrainModel(gtd, cm, world, pack, library)
     world.set_terrain(terrain.fill_chunk, (0, 0, size - 1, size - 1))
     water_cols = int((terrain.water_top > terrain.top).sum())

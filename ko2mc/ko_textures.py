@@ -184,9 +184,12 @@ class TextureLibrary:
 class TexturePack:
     """Collects custom block textures and writes a Minecraft resource pack."""
 
-    def __init__(self, title: str, resolution: int = 64):
+    def __init__(self, title: str, resolution: int = 64, brightness: float = 1.6):
         self.title = title
         self.resolution = resolution
+        # The KO client lights terrain with "modulate 2x" (then darkens it with its
+        # colour map), so stored textures are darker than they look in game.
+        self.brightness = brightness
         self.images: list[np.ndarray] = []
         self.names: list[str] = []
 
@@ -202,7 +205,8 @@ class TexturePack:
 
     def _png(self, rgba: np.ndarray) -> bytes:
         from PIL import Image
-        im = Image.fromarray(rgba, "RGBA").convert("RGB")   # terrain is opaque
+        rgb = np.clip(rgba[..., :3].astype(np.float32) * self.brightness, 0, 255).astype(np.uint8)
+        im = Image.fromarray(rgb, "RGB")   # terrain is opaque
         r = self.resolution
         if im.width != r or im.height != r:
             im = im.resize((r, r), Image.LANCZOS)

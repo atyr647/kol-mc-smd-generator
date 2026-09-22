@@ -49,6 +49,9 @@ def main():
                              "(default: ./dtex if it exists)")
     parser.add_argument("--pack-resolution", type=int, default=64, choices=[16, 32, 64, 128, 256],
                         help="Pixels per block texture in the resource pack (default 64)")
+    parser.add_argument("--pack-brightness", type=float, default=1.6,
+                        help="Brighten KO textures; the KO client draws terrain brighter "
+                             "than the files store it (default 1.6)")
     parser.add_argument("--preview", action="store_true",
                         help="Also render the KO reference and Minecraft previews")
 
@@ -94,6 +97,7 @@ def main():
         buildings=not args.no_buildings,
         ko_textures=args.ko_textures,
         pack_resolution=args.pack_resolution,
+        pack_brightness=args.pack_brightness,
     )
 
     if args.preview:
