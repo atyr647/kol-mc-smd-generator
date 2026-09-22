@@ -189,9 +189,12 @@ def _kmeans(x: np.ndarray, w: np.ndarray, k: int, seed: int, iters: int = 25) ->
     d2 = ((x - centres[0]) ** 2).sum(1)
     for _ in range(1, k):
         p = d2 * w
+        if p.sum() <= 0:           # every remaining piece is identical to a centre already
+            break
         centres.append(x[rng.choice(len(x), p=p / p.sum())])
         d2 = np.minimum(d2, ((x - centres[-1]) ** 2).sum(1))
     c = np.stack(centres)
+    k = len(c)
     xx = (x * x).sum(1)[:, None]
     for _ in range(iters):
         labels = np.empty(len(x), np.int64)

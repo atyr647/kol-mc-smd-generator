@@ -126,9 +126,82 @@ class Palette:
         return d.argmin(1)
 
 
-# Wool looks fuzzy and odd on buildings; everything else is fair game.
-SOLID_PALETTE = Palette({k: v for k, v in BLOCK_COLORS.items() if not k.endswith("_wool")})
+# Blocks that read as building material. Wool, concrete, copper and the like look odd
+# on walls, so buildings are made from these only.
+BUILD_BLOCKS = [
+    "stone", "cobblestone", "mossy_cobblestone", "stone_bricks", "mossy_stone_bricks",
+    "cracked_stone_bricks", "smooth_stone", "andesite", "polished_andesite", "diorite",
+    "polished_diorite", "granite", "polished_granite", "deepslate_bricks", "polished_deepslate",
+    "cobbled_deepslate", "tuff", "calcite", "bricks", "mud_bricks", "packed_mud", "sandstone",
+    "smooth_sandstone", "cut_sandstone", "red_sandstone", "quartz_block", "prismarine",
+    "prismarine_bricks", "dark_prismarine", "blackstone", "polished_blackstone_bricks",
+    "nether_bricks", "terracotta", "white_terracotta", "light_gray_terracotta", "gray_terracotta",
+    "brown_terracotta", "red_terracotta", "orange_terracotta", "yellow_terracotta",
+    "cyan_terracotta", "green_terracotta", "black_terracotta", "light_blue_terracotta",
+    "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks",
+    "dark_oak_planks", "mangrove_planks", "oak_log", "spruce_log", "dark_oak_log", "birch_log",
+    "gold_block", "iron_block", "snow_block", "clay", "hay_block", "bone_block", "obsidian",
+]
+# Half-height version of a block, used to make even, walkable steps.
+SLABS = {
+    "stone": "stone_slab", "cobblestone": "cobblestone_slab", "mossy_cobblestone": "mossy_cobblestone_slab",
+    "stone_bricks": "stone_brick_slab", "mossy_stone_bricks": "mossy_stone_brick_slab",
+    "smooth_stone": "smooth_stone_slab", "andesite": "andesite_slab", "polished_andesite": "polished_andesite_slab",
+    "diorite": "diorite_slab", "polished_diorite": "polished_diorite_slab", "granite": "granite_slab",
+    "polished_granite": "polished_granite_slab", "deepslate_bricks": "deepslate_brick_slab",
+    "polished_deepslate": "polished_deepslate_slab", "cobbled_deepslate": "cobbled_deepslate_slab",
+    "bricks": "brick_slab", "mud_bricks": "mud_brick_slab", "sandstone": "sandstone_slab",
+    "smooth_sandstone": "smooth_sandstone_slab", "cut_sandstone": "cut_sandstone_slab",
+    "red_sandstone": "red_sandstone_slab", "quartz_block": "quartz_slab", "prismarine": "prismarine_slab",
+    "prismarine_bricks": "prismarine_brick_slab", "dark_prismarine": "dark_prismarine_slab",
+    "blackstone": "blackstone_slab", "polished_blackstone_bricks": "polished_blackstone_brick_slab",
+    "nether_bricks": "nether_brick_slab", "oak_planks": "oak_slab", "spruce_planks": "spruce_slab",
+    "birch_planks": "birch_slab", "jungle_planks": "jungle_slab", "acacia_planks": "acacia_slab",
+    "dark_oak_planks": "dark_oak_slab", "mangrove_planks": "mangrove_slab",
+}
+SOLID_PALETTE = Palette({k: BLOCK_COLORS[k] for k in BUILD_BLOCKS if k in BLOCK_COLORS})
+SLAB_PALETTE = Palette({k: BLOCK_COLORS[k] for k in SLABS if k in BLOCK_COLORS})
 LEAF_PALETTE = Palette(LEAF_COLORS)
+
+
+def slab_state(block: str) -> str:
+    return f"minecraft:{SLABS[block]}[type=bottom,waterlogged=false]"
+
+
+def texture_regions(rgba: np.ndarray, max_colors: int = 3):
+    """Split a texture into its 1-3 main colours.
+
+    Returns (label map (h, w) int, centre colours (k, 3)). Blocks then take the colour of
+    the region they fall in, so a wall gets a few consistent blocks instead of speckles.
+    """
+    small = rgba[::4, ::4, :3].reshape(-1, 3).astype(np.float64)
+    lab = _to_lab(small)
+    centres = [lab.mean(0)]
+    for k in range(2, max_colors + 1):
+        # split the widest cluster in two (simple, deterministic)
+        lbl = ((lab[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1)
+        spread = [((lab[lbl == i] - c) ** 2).sum() for i, c in enumerate(centres)]
+        i = int(np.argmax(spread))
+        pts = lab[lbl == i]
+        if len(pts) < 8:
+            break
+        axis = np.linalg.svd(pts - pts.mean(0), full_matrices=False)[2][0]
+        proj = (pts - pts.mean(0)) @ axis
+        if (proj <= 0).all() or (proj > 0).all():
+            break
+        a, b = pts[proj <= 0].mean(0), pts[proj > 0].mean(0)
+        if ((a - b) ** 2).sum() < 18 ** 2:      # too similar to be worth a second block
+            break
+        centres[i] = a
+        centres.append(b)
+        for _ in range(5):
+            lbl = ((lab[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1)
+            centres = [lab[lbl == j].mean(0) if (lbl == j).any() else c for j, c in enumerate(centres)]
+    full = _to_lab(rgba[..., :3].reshape(-1, 3).astype(np.float64))
+    labels = ((full[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1).reshape(rgba.shape[:2])
+    rgb = np.array([rgba[..., :3].reshape(-1, 3)[labels.ravel() == j].mean(0) if (labels == j).any()
+                    else (128, 128, 128) for j in range(len(centres))])
+    return labels, rgb
 
 
 def parse_n3pmesh(data: bytes):
@@ -211,13 +284,17 @@ class ModelLibrary:
         return any(self.mesh(p.name) is None for p in shape.parts)
 
 
-def sample_part(tris_mc: np.ndarray, uvs: np.ndarray, tex, alpha_test: bool, spacing: float = 0.45):
-    """Sample points on triangles (Minecraft coords). Returns (points (P,3), rgb (P,3))."""
+def sample_part(tris_mc: np.ndarray, uvs: np.ndarray, tex, alpha_test: bool, spacing: float = 0.4):
+    """Sample points on triangles (Minecraft coords).
+
+    Returns (points (P,3), triangle index (P,), texel x (P,), texel y (P,)); texel coords are
+    -1 without a texture. See-through texels are dropped when alpha_test is set.
+    """
     e = np.stack([tris_mc[:, 1] - tris_mc[:, 0], tris_mc[:, 2] - tris_mc[:, 0],
                   tris_mc[:, 2] - tris_mc[:, 1]])
     edge = np.linalg.norm(e, axis=2).max(0)
     steps = np.clip(np.ceil(edge / spacing).astype(np.int32), 1, 300)
-    pts_all, col_all = [], []
+    out_p, out_t, out_x, out_y = [], [], [], []
     for k in np.unique(steps):
         sel = np.flatnonzero(steps == k)
         a, b = np.meshgrid(np.arange(k + 1), np.arange(k + 1), indexing="ij")
@@ -228,20 +305,20 @@ def sample_part(tris_mc: np.ndarray, uvs: np.ndarray, tex, alpha_test: bool, spa
         t = tris_mc[sel]
         pts = (w0[None, :, None] * t[:, None, 0] + w1[None, :, None] * t[:, None, 1]
                + w2[None, :, None] * t[:, None, 2]).reshape(-1, 3)
-        uv = uvs[sel]
-        tc = (w0[None, :, None] * uv[:, None, 0] + w1[None, :, None] * uv[:, None, 1]
-              + w2[None, :, None] * uv[:, None, 2]).reshape(-1, 2)
+        tri = np.repeat(sel, len(w0))
         if tex is not None:
+            uv = uvs[sel]
+            tc = (w0[None, :, None] * uv[:, None, 0] + w1[None, :, None] * uv[:, None, 1]
+                  + w2[None, :, None] * uv[:, None, 2]).reshape(-1, 2)
             h, w = tex.shape[:2]
             tx = np.floor(np.mod(tc[:, 0], 1.0) * w).astype(np.int32) % w
             ty = np.floor(np.mod(tc[:, 1], 1.0) * h).astype(np.int32) % h
-            texel = tex[ty, tx]
-            keep = texel[:, 3] >= 128 if alpha_test else np.ones(len(texel), bool)
-            pts_all.append(pts[keep])
-            col_all.append(texel[keep, :3])
+            keep = tex[ty, tx, 3] >= 128 if alpha_test else np.ones(len(tx), bool)
+            out_p.append(pts[keep]); out_t.append(tri[keep]); out_x.append(tx[keep]); out_y.append(ty[keep])
         else:
-            pts_all.append(pts)
-            col_all.append(np.full((len(pts), 3), 128, np.uint8))
-    if not pts_all:
-        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8)
-    return np.concatenate(pts_all), np.concatenate(col_all)
+            out_p.append(pts); out_t.append(tri)
+            out_x.append(np.full(len(pts), -1, np.int32)); out_y.append(np.full(len(pts), -1, np.int32))
+    if not out_p:
+        z = np.zeros(0, np.int32)
+        return np.zeros((0, 3), np.float32), z, z, z
+    return (np.concatenate(out_p), np.concatenate(out_t), np.concatenate(out_x), np.concatenate(out_y))

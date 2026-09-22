@@ -580,32 +580,97 @@ def voxelize_collision(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorl
 _SIMPLE_KINDS = {"grass", "flower", "sunflower", "reed", "mushroom"}
 
 
-def _smooth_colors(keys: np.ndarray, sums: np.ndarray, cnt: np.ndarray) -> np.ndarray:
-    """Average each block's colour with its neighbours (3x3x3), so walls get a few
-    consistent blocks instead of speckles from every little texture detail."""
-    tot_s = sums.copy()
-    tot_c = cnt.copy()
-    for dx in (-1, 0, 1):
-        for dz in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == dy == dz == 0:
-                    continue
-                nk = keys + (dx * 8192 + dz) * 1024 + dy
-                pos = np.clip(np.searchsorted(keys, nk), 0, len(keys) - 1)
-                hit = keys[pos] == nk
-                tot_s[hit] += sums[pos[hit]] * 0.5
-                tot_c[hit] += cnt[pos[hit]] * 0.5
-    return tot_s / tot_c[:, None]
+# Flat, walkable surfaces this close above the ground are filled solid underneath
+# (steps, platforms, floors), so they don't float and can be walked on.
+FILL_BELOW_STEPS = 6
+_KEY_Y = 1024
+_KEY_Z = 8192
+
+
+def _key(x, y, z):
+    return (x.astype(np.int64) * _KEY_Z + z) * _KEY_Y + (y - MIN_Y)
+
+
+def _unkey(k):
+    y = k % _KEY_Y + MIN_Y
+    xz = k // _KEY_Y
+    return xz // _KEY_Z, y, xz % _KEY_Z
+
+
+def _close_diagonal_gaps(keys: np.ndarray, ids: np.ndarray):
+    """Make a voxel surface solid: where two blocks touch only at an edge, add a block
+    between them, so walls and roofs have no see-through diagonal gaps."""
+    if len(keys) == 0:
+        return keys, ids
+    order = np.argsort(keys)
+    keys, ids = keys[order], ids[order]
+    x, y, z = _unkey(keys)
+
+    def has(xx, yy, zz):
+        k = _key(xx, yy, zz)
+        pos = np.clip(np.searchsorted(keys, k), 0, len(keys) - 1)
+        return keys[pos] == k
+
+    add_k, add_i = [], []
+    for (a, b) in (((1, 0, 0), (0, 0, 1)), ((1, 0, 0), (0, 0, -1)),
+                   ((1, 0, 0), (0, 1, 0)), ((1, 0, 0), (0, -1, 0)),
+                   ((0, 0, 1), (0, 1, 0)), ((0, 0, 1), (0, -1, 0))):
+        dx, dy, dz = a[0] + b[0], a[1] + b[1], a[2] + b[2]
+        diag = has(x + dx, y + dy, z + dz)
+        gap = diag & ~has(x + a[0], y + a[1], z + a[2]) & ~has(x + b[0], y + b[1], z + b[2])
+        if gap.any():
+            add_k.append(_key(x[gap] + a[0], y[gap] + a[1], z[gap] + a[2]))
+            add_i.append(ids[gap])
+    if add_k:
+        keys = np.concatenate([keys] + add_k)
+        ids = np.concatenate([ids] + add_i)
+    return keys, ids
 
 
 def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, cm: CoordMap,
                     library, simple_plants: bool = False) -> tuple[int, set]:
-    """Build objects from their KO 3D models. Returns (blocks placed, ids of shapes built)."""
+    """Build objects from their KO 3D models. Returns (blocks placed, ids of shapes built).
+
+    - Walls and other steep surfaces become full blocks.
+    - Flat walkable surfaces (floors, stair treads) snap to half-block heights: a bottom
+      slab or a full block, so steps are even and can be walked up. Low ones are filled
+      solid down to the ground.
+    - Each texture is reduced to its 1-3 main colours, so a wall gets a few consistent
+      building blocks rather than speckles.
+    - Diagonal gaps in walls and roofs are closed.
+    """
     from . import ko_models as km
 
     size = cm.size_blocks
-    keys_l, col_l, cnt_l, leaf_l = [], [], [], []
+    PRIO_FULL, PRIO_SLAB = 2, 1
+    rec_k, rec_b, rec_p = [], [], []
+    region_cache = {}
     built, missing = set(), 0
+
+    def region_blocks(tname, tex, alpha, diffuse):
+        key = (tname, alpha)
+        if key not in region_cache:
+            if tex is None:
+                labels = None
+                rgb = np.array([[int(c * 255) for c in diffuse[:3]]], np.float64).clip(40, 230)
+            else:
+                labels, rgb = km.texture_regions(tex)
+            full, slab = [], []
+            for c in rgb:
+                green = c[1] > c[0] * 1.05 and c[1] > c[2] * 1.05
+                if alpha and green:
+                    n = km.LEAF_PALETTE.names[km.LEAF_PALETTE.nearest(c[None])[0]]
+                    fid = world.block_id(km.block_state(n))
+                    full.append(fid)
+                    slab.append(fid)
+                    continue
+                n = km.SOLID_PALETTE.names[km.SOLID_PALETTE.nearest(c[None])[0]]
+                full.append(world.block_id(km.block_state(n)))
+                sn = n if n in km.SLABS else km.SLAB_PALETTE.names[km.SLAB_PALETTE.nearest(c[None])[0]]
+                slab.append(world.block_id(km.slab_state(sn)))
+            region_cache[key] = (labels, np.array(full, np.uint16), np.array(slab, np.uint16))
+        return region_cache[key]
+
     for i, shape in enumerate(opd.shapes):
         name = shape.name.lower()
         if re.search(r"fx|smoke|fog|smog|collisioncube|alpha", name) or not shape.parts:
@@ -615,55 +680,90 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
         if library.missing(shape):
             missing += 1
             continue
+        mirrored = shape.scale.x * shape.scale.y * shape.scale.z < 0
         for tris, uvs, tex, part in library.shape_parts(shape):
             if part.dest_blend == 2:          # additive glow effects, not solid
                 continue
             mc = np.stack([cm.x(tris[..., 0]), cm.y(tris[..., 1]), cm.z(tris[..., 2])], -1)
             alpha = bool(part.render_flags & km.RF_ALPHABLENDING) or (
                 tex is not None and (tex[..., 3] < 128).mean() > 0.05)
-            pts, rgb = km.sample_part(mc, uvs, tex, alpha)
+            tname = part.textures[0].lower() if part.textures else ""
+            labels, full_ids, slab_ids = region_blocks(tname, tex, alpha, part.diffuse)
+            pts, tri, tx, ty = km.sample_part(mc, uvs, tex, alpha)
             if len(pts) == 0:
                 continue
-            v = np.floor(pts).astype(np.int64)
-            ok = (v[:, 0] >= 0) & (v[:, 0] < size) & (v[:, 2] >= 0) & (v[:, 2] < size)
-            v, rgb = v[ok], rgb[ok]
-            # leave the ground alone where the model is buried in it
-            ok = v[:, 1] >= terrain.top[v[:, 2], v[:, 0]]
-            v, rgb = v[ok], rgb[ok].astype(np.float64)
-            if len(v) == 0:
-                continue
-            key = (v[:, 0] * 8192 + v[:, 2]) * 1024 + (v[:, 1] - MIN_Y)
-            uk, inv = np.unique(key, return_inverse=True)
-            sums = np.zeros((len(uk), 3))
-            np.add.at(sums, inv, rgb)
-            cnt = np.bincount(inv, minlength=len(uk)).astype(np.float64)
-            green = (rgb[:, 1] > rgb[:, 0] * 1.05) & (rgb[:, 1] > rgb[:, 2] * 1.05)
-            leaf = np.bincount(inv, weights=(green & alpha).astype(float), minlength=len(uk))
-            keys_l.append(uk); col_l.append(sums); cnt_l.append(cnt); leaf_l.append(leaf)
+            region = labels[ty, tx] if labels is not None else np.zeros(len(pts), np.int64)
+            # outward normals point down after the z flip, hence the minus
+            nrm = -np.cross(mc[:, 1] - mc[:, 0], mc[:, 2] - mc[:, 0])
+            if mirrored:
+                nrm = -nrm
+            ny = nrm[:, 1] / (np.linalg.norm(nrm, axis=1) + 1e-9)
+            flat = (np.abs(ny) > 0.7)[tri] & (not alpha)
+            up = (ny > 0.7)[tri] & (not alpha)
+
+            vx = np.floor(pts[:, 0]).astype(np.int64)
+            vz = np.floor(pts[:, 2]).astype(np.int64)
+            inside = (vx >= 0) & (vx < size) & (vz >= 0) & (vz < size)
+            ground = np.full(len(pts), MAX_Y, np.int64)
+            ground[inside] = terrain.top[vz[inside], vx[inside]]
+
+            # walls: plain voxels
+            wall = inside & ~up
+            wy = np.floor(pts[:, 1]).astype(np.int64)
+            wall &= wy >= ground
+            wk, wb = _close_diagonal_gaps(_key(vx[wall], wy[wall], vz[wall]), full_ids[region[wall]])
+            rec_k.append(wk); rec_b.append(wb); rec_p.append(np.full(len(wk), PRIO_FULL, np.int8))
+
+            # walkable tops: snap to half blocks
+            top = inside & up
+            if top.any():
+                q = np.round(pts[top, 1] * 2) / 2
+                half = (q % 1) != 0
+                ty_ = np.where(half, np.floor(q), q - 1).astype(np.int64)
+                tx_, tz_, g = vx[top], vz[top], ground[top]
+                rid = region[top]
+                keep = ty_ > g
+                keep_slab = keep & half
+                keep_full = keep & ~half
+                rec_k.append(_key(tx_[keep_full], ty_[keep_full], tz_[keep_full]))
+                rec_b.append(full_ids[rid[keep_full]]); rec_p.append(np.full(keep_full.sum(), PRIO_FULL, np.int8))
+                rec_k.append(_key(tx_[keep_slab], ty_[keep_slab], tz_[keep_slab]))
+                rec_b.append(slab_ids[rid[keep_slab]]); rec_p.append(np.full(keep_slab.sum(), PRIO_SLAB, np.int8))
+                # fill steps/platforms down to the ground
+                low = keep & (ty_ - g <= FILL_BELOW_STEPS)
+                if low.any():
+                    cols = np.unique(np.stack([tx_[low], tz_[low], ty_[low], g[low], rid[low]], 1), axis=0)
+                    depth = cols[:, 2] - cols[:, 3] - 1
+                    rep = np.repeat(np.arange(len(cols)), np.maximum(depth, 0))
+                    if len(rep):
+                        off = np.arange(len(rep)) - np.repeat(np.cumsum(np.maximum(depth, 0)) - np.maximum(depth, 0),
+                                                              np.maximum(depth, 0))
+                        fy = cols[rep, 3] + 1 + off
+                        rec_k.append(_key(cols[rep, 0], fy, cols[rep, 1]))
+                        rec_b.append(full_ids[cols[rep, 4]])
+                        rec_p.append(np.full(len(rep), PRIO_FULL, np.int8))
         built.add(i)
-        if len(built) % 1000 == 0:
+        if len(built) % 2000 == 0:
             print(f"    {len(built)} objects built...")
-    if not keys_l:
+
+    if not rec_k:
         return 0, built
-    keys = np.concatenate(keys_l)
-    uk, inv = np.unique(keys, return_inverse=True)
-    sums = np.zeros((len(uk), 3))
-    np.add.at(sums, inv, np.concatenate(col_l))
-    cnt = np.bincount(inv, weights=np.concatenate(cnt_l))
-    leaf = np.bincount(inv, weights=np.concatenate(leaf_l)) > cnt * 0.5
-    rgb = _smooth_colors(uk, sums, cnt)
-    ids = np.zeros(len(uk), np.uint16)
-    for palette, mask in ((km.SOLID_PALETTE, ~leaf), (km.LEAF_PALETTE, leaf)):
-        if mask.any():
-            choice = palette.nearest(rgb[mask])
-            lut = np.array([world.block_id(km.block_state(n)) for n in palette.names], np.uint16)
-            ids[mask] = lut[choice]
-    y = uk % 1024 + MIN_Y
-    xz = uk // 1024
-    world.set_blocks(xz // 8192, y, xz % 8192, ids)
+    keys = np.concatenate(rec_k)
+    blocks = np.concatenate(rec_b).astype(np.int64)
+    prio = np.concatenate(rec_p).astype(np.int64)
+    # count votes per (voxel, block, priority), then keep the best per voxel:
+    # full blocks beat slabs, then the most common block wins
+    combo = np.stack([keys, blocks, prio], 1)
+    uc, counts = np.unique(combo, axis=0, return_counts=True)
+    order = np.lexsort((-counts, -uc[:, 2], uc[:, 0]))
+    uc = uc[order]
+    first = np.r_[True, uc[1:, 0] != uc[:-1, 0]]
+    win = uc[first]
+    x, y, z = _unkey(win[:, 0])
+    world.set_blocks(x, y, z, win[:, 1].astype(np.uint16))
     if missing:
         print(f"  {missing} objects have model files missing; using simple stand-ins for them")
-    return len(uk), built
+    return len(win), built
 
 
 def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
