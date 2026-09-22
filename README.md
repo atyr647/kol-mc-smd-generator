@@ -63,7 +63,14 @@ The converter prints where warp gates and bind points ended up, and how KO coord
 
 ## Real KO buildings and trees (3D models)
 
-Every object in an `.opd` lists its model parts. With `--ko-models` pointing at the KO client's `Object` folder, each object is rebuilt from those models: parts are placed with the object's position, rotation and scale, the model surface is filled with blocks, and each block is the Minecraft block whose colour best matches the KO texture at that spot (leaves for green see-through parts like tree leaves). Every model is converted, including grass, flowers and reeds; add `--simple-plants` to use single Minecraft plants for those instead. Effect objects (glows, smoke, sparkles) are skipped because they aren't solid.
+Every object in an `.opd` lists its model parts. With `--ko-models` pointing at the KO client's `Object` folder, each object is rebuilt from those models: parts are placed with the object's position, rotation and scale, the model surface is filled with blocks, and each block is the Minecraft block whose colour best matches the KO texture at that spot (leaves for green see-through parts like tree leaves). To keep buildings clean and walkable:
+
+- Each KO texture is split into a few large colour patches (roof tiles, wall, wooden beams...), and every block takes its patch's block, so walls look consistent instead of speckled. Wood-looking blocks (logs, planks, hay) are only used for textures whose names suggest wood.
+- Floors, platforms and stair treads snap to half-block heights (slabs), and low ones are filled solid down to the ground.
+- Where a walkable surface rises by exactly one block, the edge becomes a stairs block, so you can walk up without jumping.
+- Diagonal gaps in walls and roofs are closed.
+
+Every model is converted, including grass, flowers and reeds; add `--simple-plants` to use single Minecraft plants for those instead. Effect objects (glows, smoke, sparkles) are skipped because they aren't solid.
 
 ```bash
 C="../knight-online-minecraft-conversion-plugin-directory/additions/USKO Moradon Patch (v1298)/Client"

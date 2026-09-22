@@ -627,6 +627,59 @@ def _close_diagonal_gaps(keys: np.ndarray, ids: np.ndarray):
     return keys, ids
 
 
+def _add_stairs(keys, ids, walk_keys, terrain, world, cm):
+    """Turn one-block rises on walkable surfaces into stairs, so they can be walked up
+    without jumping. A walkable block becomes stairs when the ground in front of it is
+    exactly one block lower and behind it is at least as high."""
+    from . import ko_models as km
+    if len(walk_keys) == 0:
+        return ids
+    order = np.argsort(keys)
+    skeys, sids = keys[order], ids[order]
+    names = world.palette
+    solid_id = np.array([not (n.endswith("air") or "leaves" in n or "slab" in n) for n in names] +
+                        [False] * 0)
+
+    def lookup(k):
+        pos = np.clip(np.searchsorted(skeys, k), 0, len(skeys) - 1)
+        hit = skeys[pos] == k
+        return hit, sids[pos]
+
+    size = cm.size_blocks
+
+    def solid(x, y, z):
+        inside = (x >= 0) & (x < size) & (z >= 0) & (z < size)
+        ground = np.full(len(x), -10_000, np.int64)
+        ground[inside] = terrain.top[np.clip(z, 0, size - 1), np.clip(x, 0, size - 1)][inside]
+        hit, bid = lookup(_key(x, y, z))
+        return (y <= ground) | (hit & solid_id[np.minimum(bid, len(solid_id) - 1)])
+
+    wx, wy, wz = _unkey(walk_keys)
+    hit, bid = lookup(walk_keys)
+    ok = hit & solid_id[np.minimum(bid, len(solid_id) - 1)]
+    ok &= ~solid(wx, wy + 1, wz) & ~solid(wx, wy + 2, wz)          # room to stand on it
+    new_ids = {}
+    for (dx, dz), facing in (((0, 1), "north"), ((0, -1), "south"), ((1, 0), "west"), ((-1, 0), "east")):
+        # the ground is one lower in direction (dx, dz); tall side of the stairs faces away
+        lower = solid(wx + dx, wy - 1, wz + dz) & ~solid(wx + dx, wy, wz + dz)
+        back = solid(wx - dx, wy, wz - dz)
+        m = ok & lower & back
+        for k, b in zip(walk_keys[m], bid[m]):
+            if k in new_ids:
+                continue
+            base = names[int(b)].split("[")[0].removeprefix("minecraft:")
+            new_ids[int(k)] = world.block_id(km.stairs_state(base, facing))
+    if new_ids:
+        nk = np.fromiter(new_ids.keys(), np.int64)
+        nv = np.fromiter(new_ids.values(), np.int64)
+        pos = np.searchsorted(skeys, nk)
+        sids[pos] = nv
+        ids = np.empty_like(ids)
+        ids[order] = sids
+        print(f"  {len(new_ids)} step edges turned into stairs")
+    return ids
+
+
 def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, cm: CoordMap,
                     library, simple_plants: bool = False) -> tuple[int, set]:
     """Build objects from their KO 3D models. Returns (blocks placed, ids of shapes built).
@@ -644,11 +697,12 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
     size = cm.size_blocks
     PRIO_FULL, PRIO_SLAB = 2, 1
     rec_k, rec_b, rec_p = [], [], []
+    walk_k = []          # tops of walkable surfaces (full blocks), candidates for stairs
     region_cache = {}
     built, missing = set(), 0
 
-    def region_blocks(tname, tex, alpha, diffuse):
-        key = (tname, alpha)
+    def region_blocks(tname, tex, alpha, diffuse, shape_name):
+        key = (tname, alpha, bool(re.search(km.WOOD_WORDS, tname + " " + shape_name)))
         if key not in region_cache:
             if tex is None:
                 labels = None
@@ -664,9 +718,10 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
                     full.append(fid)
                     slab.append(fid)
                     continue
-                n = km.SOLID_PALETTE.names[km.SOLID_PALETTE.nearest(c[None])[0]]
+                woody = bool(re.search(km.WOOD_WORDS, tname + " " + shape_name))
+                n = km.SOLID_PALETTE.names[km.SOLID_PALETTE.nearest(c[None], woody)[0]]
                 full.append(world.block_id(km.block_state(n)))
-                sn = n if n in km.SLABS else km.SLAB_PALETTE.names[km.SLAB_PALETTE.nearest(c[None])[0]]
+                sn = n if n in km.SLABS else km.SLAB_PALETTE.names[km.SLAB_PALETTE.nearest(c[None], woody)[0]]
                 slab.append(world.block_id(km.slab_state(sn)))
             region_cache[key] = (labels, np.array(full, np.uint16), np.array(slab, np.uint16))
         return region_cache[key]
@@ -688,7 +743,7 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
             alpha = bool(part.render_flags & km.RF_ALPHABLENDING) or (
                 tex is not None and (tex[..., 3] < 128).mean() > 0.05)
             tname = part.textures[0].lower() if part.textures else ""
-            labels, full_ids, slab_ids = region_blocks(tname, tex, alpha, part.diffuse)
+            labels, full_ids, slab_ids = region_blocks(tname, tex, alpha, part.diffuse, name)
             pts, tri, tx, ty = km.sample_part(mc, uvs, tex, alpha)
             if len(pts) == 0:
                 continue
@@ -727,6 +782,7 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
                 keep_full = keep & ~half
                 rec_k.append(_key(tx_[keep_full], ty_[keep_full], tz_[keep_full]))
                 rec_b.append(full_ids[rid[keep_full]]); rec_p.append(np.full(keep_full.sum(), PRIO_FULL, np.int8))
+                walk_k.append(rec_k[-1])
                 rec_k.append(_key(tx_[keep_slab], ty_[keep_slab], tz_[keep_slab]))
                 rec_b.append(slab_ids[rid[keep_slab]]); rec_p.append(np.full(keep_slab.sum(), PRIO_SLAB, np.int8))
                 # fill steps/platforms down to the ground
@@ -759,8 +815,10 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
     uc = uc[order]
     first = np.r_[True, uc[1:, 0] != uc[:-1, 0]]
     win = uc[first]
+    walk_keys = np.unique(np.concatenate(walk_k)) if walk_k else np.zeros(0, np.int64)
+    ids = _add_stairs(win[:, 0], win[:, 1].copy(), walk_keys, terrain, world, cm)
     x, y, z = _unkey(win[:, 0])
-    world.set_blocks(x, y, z, win[:, 1].astype(np.uint16))
+    world.set_blocks(x, y, z, ids.astype(np.uint16))
     if missing:
         print(f"  {missing} objects have model files missing; using simple stand-ins for them")
     return len(win), built

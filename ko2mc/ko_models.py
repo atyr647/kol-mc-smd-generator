@@ -113,16 +113,26 @@ def _to_lab(rgb: np.ndarray) -> np.ndarray:
     return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
 
 
+WOOD_WORDS = r"wood|namu|plank|board|tree|bark|log|door|box|ship|boat|bridge|table|chair|bench|barrel|fence|roof|fu\b|zipfu|jip"
+_WOOD_BLOCKS = ("_planks", "_log", "hay_block", "bone_block")
+
+
 class Palette:
     """Nearest-colour lookup from RGB to a Minecraft block."""
 
     def __init__(self, colors: dict):
         self.names = list(colors)
         self.lab = _to_lab(np.array([colors[n] for n in self.names]))
+        self.wood = np.array([n.endswith(_WOOD_BLOCKS) for n in self.names])
 
-    def nearest(self, rgb: np.ndarray) -> np.ndarray:
+    def nearest(self, rgb: np.ndarray, woody: bool | None = None) -> np.ndarray:
+        """woody=False keeps wood-looking blocks out (for stone walls), True prefers them."""
         lab = _to_lab(rgb)
         d = ((lab[:, None, :] - self.lab[None, :, :]) ** 2).sum(-1)
+        if woody is False:
+            d = d + np.where(self.wood, 1e6, 0)[None]
+        elif woody is True:
+            d = d + np.where(self.wood, 0, 150)[None]
         return d.argmin(1)
 
 
@@ -141,6 +151,7 @@ BUILD_BLOCKS = [
     "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks",
     "dark_oak_planks", "mangrove_planks", "oak_log", "spruce_log", "dark_oak_log", "birch_log",
     "gold_block", "iron_block", "snow_block", "clay", "hay_block", "bone_block", "obsidian",
+    "weathered_copper", "oxidized_copper", "warped_planks", "crimson_planks",
 ]
 # Half-height version of a block, used to make even, walkable steps.
 SLABS = {
@@ -159,7 +170,32 @@ SLABS = {
     "birch_planks": "birch_slab", "jungle_planks": "jungle_slab", "acacia_planks": "acacia_slab",
     "dark_oak_planks": "dark_oak_slab", "mangrove_planks": "mangrove_slab",
 }
+# Stairs version of a block, used where a walkable surface rises by one block.
+STAIRS = {
+    "stone": "stone_stairs", "cobblestone": "cobblestone_stairs", "mossy_cobblestone": "mossy_cobblestone_stairs",
+    "stone_bricks": "stone_brick_stairs", "mossy_stone_bricks": "mossy_stone_brick_stairs",
+    "andesite": "andesite_stairs", "polished_andesite": "polished_andesite_stairs", "diorite": "diorite_stairs",
+    "polished_diorite": "polished_diorite_stairs", "granite": "granite_stairs", "polished_granite": "polished_granite_stairs",
+    "deepslate_bricks": "deepslate_brick_stairs", "polished_deepslate": "polished_deepslate_stairs",
+    "cobbled_deepslate": "cobbled_deepslate_stairs", "bricks": "brick_stairs", "mud_bricks": "mud_brick_stairs",
+    "sandstone": "sandstone_stairs", "smooth_sandstone": "smooth_sandstone_stairs", "red_sandstone": "red_sandstone_stairs",
+    "quartz_block": "quartz_stairs", "prismarine": "prismarine_stairs", "prismarine_bricks": "prismarine_brick_stairs",
+    "dark_prismarine": "dark_prismarine_stairs", "blackstone": "blackstone_stairs",
+    "polished_blackstone_bricks": "polished_blackstone_brick_stairs", "nether_bricks": "nether_brick_stairs",
+    "oak_planks": "oak_stairs", "spruce_planks": "spruce_stairs", "birch_planks": "birch_stairs",
+    "jungle_planks": "jungle_stairs", "acacia_planks": "acacia_stairs", "dark_oak_planks": "dark_oak_stairs",
+    "mangrove_planks": "mangrove_stairs", "warped_planks": "warped_stairs", "crimson_planks": "crimson_stairs",
+}
 SOLID_PALETTE = Palette({k: BLOCK_COLORS[k] for k in BUILD_BLOCKS if k in BLOCK_COLORS})
+STAIRS_PALETTE = Palette({k: BLOCK_COLORS[k] for k in STAIRS if k in BLOCK_COLORS})
+
+
+def stairs_state(block: str, facing: str) -> str:
+    """Stairs made of `block` (or the closest block that has stairs), tall side toward `facing`."""
+    if block not in STAIRS:
+        c = BLOCK_COLORS.get(block, (128, 128, 128))
+        block = STAIRS_PALETTE.names[STAIRS_PALETTE.nearest(np.array([c], np.float64))[0]]
+    return f"minecraft:{STAIRS[block]}[facing={facing},half=bottom,shape=straight,waterlogged=false]"
 SLAB_PALETTE = Palette({k: BLOCK_COLORS[k] for k in SLABS if k in BLOCK_COLORS})
 LEAF_PALETTE = Palette(LEAF_COLORS)
 
@@ -168,40 +204,69 @@ def slab_state(block: str) -> str:
     return f"minecraft:{SLABS[block]}[type=bottom,waterlogged=false]"
 
 
-def texture_regions(rgba: np.ndarray, max_colors: int = 3):
-    """Split a texture into its 1-3 main colours.
+def texture_regions(rgba: np.ndarray, max_colors: int = 3, cell: int = 8):
+    """Split a texture into up to 3 large colour patches (e.g. roof tiles, wall, wood).
 
-    Returns (label map (h, w) int, centre colours (k, 3)). Blocks then take the colour of
-    the region they fall in, so a wall gets a few consistent blocks instead of speckles.
+    Returns (label map (h, w) int, patch colours (k, 3)). Labels are decided per
+    cell x cell block of texels and smoothed, so a wall gets one consistent block per
+    patch instead of speckles from fine texture detail.
     """
-    small = rgba[::4, ::4, :3].reshape(-1, 3).astype(np.float64)
-    lab = _to_lab(small)
+    h, w = rgba.shape[:2]
+    cell = max(1, min(cell, h // 4, w // 4))
+    ch, cw = h // cell, w // cell
+    img = rgba[:ch * cell, :cw * cell, :3].astype(np.float64)
+    coarse = img.reshape(ch, cell, cw, cell, 3).mean((1, 3))           # (ch, cw, 3)
+    lab = _to_lab(coarse.reshape(-1, 3))
     centres = [lab.mean(0)]
-    for k in range(2, max_colors + 1):
-        # split the widest cluster in two (simple, deterministic)
+    while len(centres) < max_colors:
         lbl = ((lab[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1)
         spread = [((lab[lbl == i] - c) ** 2).sum() for i, c in enumerate(centres)]
         i = int(np.argmax(spread))
         pts = lab[lbl == i]
-        if len(pts) < 8:
+        if len(pts) < 4:
             break
         axis = np.linalg.svd(pts - pts.mean(0), full_matrices=False)[2][0]
         proj = (pts - pts.mean(0)) @ axis
         if (proj <= 0).all() or (proj > 0).all():
             break
         a, b = pts[proj <= 0].mean(0), pts[proj > 0].mean(0)
-        if ((a - b) ** 2).sum() < 18 ** 2:      # too similar to be worth a second block
+        if ((a - b) ** 2).sum() < 22 ** 2:      # too similar to be worth another block
             break
         centres[i] = a
         centres.append(b)
-        for _ in range(5):
+        for _ in range(6):
             lbl = ((lab[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1)
             centres = [lab[lbl == j].mean(0) if (lbl == j).any() else c for j, c in enumerate(centres)]
-    full = _to_lab(rgba[..., :3].reshape(-1, 3).astype(np.float64))
-    labels = ((full[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1).reshape(rgba.shape[:2])
-    rgb = np.array([rgba[..., :3].reshape(-1, 3)[labels.ravel() == j].mean(0) if (labels == j).any()
-                    else (128, 128, 128) for j in range(len(centres))])
-    return labels, rgb
+    k = len(centres)
+    lbl = ((lab[:, None] - np.array(centres)[None]) ** 2).sum(-1).argmin(1).reshape(ch, cw)
+    # majority filter (3x3 cells, wrapping like the texture does)
+    onehot = np.eye(k)[lbl]
+    votes = sum(np.roll(np.roll(onehot, dy, 0), dx, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+    lbl = votes.argmax(-1)
+    labels = np.repeat(np.repeat(lbl, cell, 0), cell, 1)
+    labels = np.pad(labels, ((0, h - labels.shape[0]), (0, w - labels.shape[1])), mode="edge")
+    rgb = []
+    for j in range(k):
+        m = lbl == j
+        c = coarse[m].mean(0) if m.any() else coarse.reshape(-1, 3).mean(0)
+        # averaging textured patches washes colours out; give some saturation back
+        l = _to_lab(c[None])[0]
+        # (and KO lights objects brighter than the textures are stored)
+        rgb.append(_from_lab(np.array([min(l[0] * 1.15, 95), l[1] * 1.15, l[2] * 1.15])))
+    return labels, np.array(rgb)
+
+
+def _from_lab(lab: np.ndarray) -> np.ndarray:
+    """CIE Lab -> sRGB (0-255)."""
+    L, a, b = lab
+    fy = (L + 16) / 116
+    fx, fz = fy + a / 500, fy - b / 200
+    f = np.array([fx, fy, fz])
+    xyz = np.where(f ** 3 > 0.008856, f ** 3, (f - 16 / 116) / 7.787) * np.array([0.9505, 1.0, 1.089])
+    m = np.array([[3.2406, -1.5372, -0.4986], [-0.9689, 1.8758, 0.0415], [0.0557, -0.2040, 1.0570]])
+    c = m @ xyz
+    c = np.where(c > 0.0031308, 1.055 * np.clip(c, 0, None) ** (1 / 2.4) - 0.055, 12.92 * c)
+    return np.clip(c * 255, 0, 255)
 
 
 def parse_n3pmesh(data: bytes):
