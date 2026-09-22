@@ -147,8 +147,8 @@ class TerrainModel:
         self.tex = gtd.tex1[tx, tz]
 
         # KO textures via the resource pack: tile texture index -> note block state
-        self.custom_ids = np.zeros(1024, dtype=np.uint16)     # 0 = use the material block
-        self.custom_below = np.zeros(1024, dtype=np.uint16)
+        self.col_custom = None   # per column KO ground block (note block state), 0 = none
+        self.col_below = None
         if texture_pack is not None and library is not None:
             self._assign_textures(gtd, world, texture_pack, library)
 
@@ -169,28 +169,44 @@ class TerrainModel:
         self.water = world.block_id(materials.WATER_BLOCK)
 
     def _assign_textures(self, gtd, world, pack, library):
-        from .ko_textures import custom_state, tile_texture_key
-        used, counts = np.unique(self.tex, return_counts=True)
-        order = np.argsort(-counts)        # most common first, in case we run out of states
-        missing = set()
-        for idx in used[order]:
-            key = tile_texture_key(gtd, int(idx))
-            if key is None:
-                continue
-            rgba = library.tile(*key)
-            if rgba is None:
-                missing.add(key[0] if library.textures_in(key[0]) is None else f"{key[0]} #{key[1]}")
-                continue
-            slot = pack.add(rgba, f"{key[0]} #{key[1]}")
+        """Give every column a piece of the real KO ground (base + overlay texture,
+        rotated like KO does), grouped into as many textures as there are note block states."""
+        from .ko_ground import GroundBuilder
+        from .ko_textures import MAX_CUSTOM, custom_state
+        gb = GroundBuilder(gtd, library, 1.0)   # the pack applies the brightness
+        missing = sorted({gtd.tile_files[i] for i in np.unique(gb.t1)
+                          if i < len(gtd.tile_files) and int(i) not in gb.found})
+        s = self.cm.scale
+        group, reps = gb.block_textures(s, MAX_CUSTOM)
+        if group is None:
+            print("  KO textures: none of this map's ground textures were found")
+            return
+        ids, below = [], []
+        for g, img in enumerate(reps):
+            slot = pack.add(img, f"ground piece {g}") if img is not None else None
             if slot is None:
-                print("  Note: more KO textures than available note block states; rest use normal blocks")
-                break
-            state, below = custom_state(slot)
-            self.custom_ids[idx] = world.block_id(state)
-            self.custom_below[idx] = world.block_id(below)
-        print(f"  KO textures: {len(pack.images)} of {len(used)} used tile textures found")
+                ids.append(0)
+                below.append(0)
+                continue
+            state, under = custom_state(slot)
+            ids.append(world.block_id(state))
+            below.append(world.block_id(under))
+        ids = np.array(ids + [0], np.uint16)          # index -1 -> 0 (no KO texture)
+        below = np.array(below + [0], np.uint16)
+        size = self.cm.size_blocks
+        n = gtd.heightmap_size - 1
+        i = np.arange(size)
+        tx = np.clip(i // s, 0, n - 1)
+        tz = np.clip((size - 1 - i) // s, 0, n - 1)    # MC row j -> KO tile z
+        sub_x = i % s
+        sub_z = (i - (size - (tz + 1) * s)) % s          # rows run north -> south in a tile
+        g = group[tx[None, :], tz[:, None], sub_x[None, :], sub_z[:, None]]   # [z, x]
+        self.col_custom = ids[g]
+        self.col_below = below[g]
+        print(f"  KO ground: {len(reps)} block textures from {len(np.unique(g))} pieces "
+              f"(scale {s}: each KO tile = {s}x{s} blocks)")
         if missing:
-            print(f"  Missing: {', '.join(sorted(missing)[:12])}{' ...' if len(missing) > 12 else ''}")
+            print(f"  Missing: {', '.join(missing[:12])}{' ...' if len(missing) > 12 else ''}")
 
     def _rasterize_water(self, tris_ko: np.ndarray):
         cm = self.cm
@@ -232,11 +248,13 @@ class TerrainModel:
         ys = (np.arange(out.shape[0]) + MIN_Y)[:, None, None]
         view = out[:, za - z0:zb - z0, xa - x0:xb - x0]
         surface = np.where(wet, self.wet_surface_ids[mat], self.surface_ids[mat])
-        tex = self.tex[za:zb, xa:xb]
-        custom = self.custom_ids[tex]
-        surface = np.where(custom > 0, custom, surface)
-        sub = np.where(ys == top - 1, np.where(custom > 0, self.custom_below[tex], self.sub_ids[mat]),
-                       self.sub_ids[mat])
+        if self.col_custom is not None:
+            custom = self.col_custom[za:zb, xa:xb]
+            surface = np.where(custom > 0, custom, surface)
+            sub = np.where(ys == top - 1, np.where(custom > 0, self.col_below[za:zb, xa:xb],
+                                                   self.sub_ids[mat]), self.sub_ids[mat])
+        else:
+            sub = self.sub_ids[mat]
         view[:] = np.where(ys < top - 3, self.deep_ids[mat], np.where(ys < top, sub, surface))
         view[ys > top] = 0
         water = (ys > top) & (ys <= wtop)
@@ -652,7 +670,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 world_name: str = "KnightOnline", scale: int = 4,
                 vertical_scale: float | None = None, objects: bool = True,
                 buildings: bool = True, ko_textures: str | None = None,
-                pack_resolution: int = 64, pack_brightness: float = 1.6,
+                pack_resolution: int = 32, pack_brightness: float = 1.3,
                 ko_models: str | None = None, simple_plants: bool = False) -> str:
     """Convert KO map files to a Minecraft world.
 

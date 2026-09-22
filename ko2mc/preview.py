@@ -86,7 +86,7 @@ class KOScene:
 
     def __init__(self, gtd_path: str, opd_path: str | None, cm: CoordMap | None = None,
                  models_dir: str | None = None, textures_dir: str | None = None,
-                 brightness: float = 1.6):
+                 brightness: float = 1.3):
         print(f"Loading KO map {gtd_path}")
         self.models_dir = models_dir if models_dir and os.path.isdir(models_dir) else None
         self.textures_dir = textures_dir if textures_dir and os.path.isdir(textures_dir) else None
@@ -212,35 +212,33 @@ class KOScene:
             "models": self._models_data(),
         }
 
-    def _terrain_texture(self, px: int = 8) -> str | None:
-        """The KO ground textures baked into one image (px pixels per tile), as a JPEG data URL."""
+    def _terrain_texture(self, px: int = 16) -> str | None:
+        """The KO ground (base + overlay textures, rotated like KO) baked into one JPEG."""
         if not self.textures_dir:
             return None
         from PIL import Image
-        from .ko_textures import TextureLibrary, tile_texture_key
-        gtd = self.gtd
-        lib = TextureLibrary(self.textures_dir)
-        n = gtd.heightmap_size - 1
-        small = {}
-        for idx in np.unique(gtd.tex1[:n, :n]):
-            key = tile_texture_key(gtd, int(idx))
-            rgba = lib.tile(*key) if key else None
-            if rgba is not None:
-                im = Image.fromarray(rgba[..., :3]).resize((px, px), Image.BOX)
-                small[int(idx)] = np.clip(np.asarray(im, np.float32) * self.brightness, 0, 255).astype(np.uint8)
-        if not small:
+        from .ko_ground import GroundBuilder
+        from .ko_textures import TextureLibrary
+        gb = GroundBuilder(self.gtd, TextureLibrary(self.textures_dir), self.brightness)
+        if not gb.images:
             return None
-        names, grid = materials.material_grid(gtd)
+        n = gb.t1.shape[0]
+        names, grid = materials.material_grid(self.gtd)
         fallback = np.array([materials.MATERIALS[m].ko_color for m in names], np.uint8)
+        inv, examples = gb.combos()
+        small = []
+        for tx, tz in examples:
+            im = gb.tile_image(tx, tz)
+            small.append(None if im is None else
+                         np.asarray(Image.fromarray(im.astype(np.uint8)).resize((px, px), Image.BOX)))
         img = np.zeros((n * px, n * px, 3), np.uint8)
         for tx in range(n):
             for tz in range(n):
-                tile = small.get(int(gtd.tex1[tx, tz]))
+                tile = small[inv[tx, tz]]
                 row = (n - 1 - tz) * px        # north up
-                if tile is None:
-                    img[row:row + px, tx * px:(tx + 1) * px] = fallback[grid[tx, tz]]
-                else:
-                    img[row:row + px, tx * px:(tx + 1) * px] = tile
+                img[row:row + px, tx * px:(tx + 1) * px] = fallback[grid[tx, tz]] if tile is None else tile
+        if img.shape[0] > 8192:
+            img = np.asarray(Image.fromarray(img).resize((8192, 8192), Image.BOX))
         buf = io.BytesIO()
         Image.fromarray(img).save(buf, "JPEG", quality=85)
         return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
@@ -607,7 +605,7 @@ def preview_compare(world_dir, out_dir=None, mc_jar=None, download=False, area=N
     gtd = parse_gtd(gtd_path, verbose=False)
     cm = CoordMap(**c) if c else CoordMap.for_map(gtd, 4)
     ko = KOScene(gtd_path, opd_path, cm, info.get("ko_models"), info.get("ko_textures"),
-                 info.get("pack_brightness", 1.6))
+                 info.get("pack_brightness", 1.3))
     mc = MCScene(world_dir, mc_jar, download)
 
     ko_img = ko.top_down()

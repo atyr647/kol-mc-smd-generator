@@ -48,8 +48,8 @@ python -m ko2mc --preview gtd/moradon.gtd
 | `--ko-models DIR` | KO client `Object` folder (`.n3pmesh`, `.dxt`) for real buildings/trees (default: `object/` if it has any) |
 | `--simple-plants` | With models: grass/flowers/reeds as single Minecraft plants |
 | `--ko-textures DIR` | Folder with KO `.gtt` files (default: `dtex/` if it has any) |
-| `--pack-resolution` | Pixels per block in the texture pack (default 64) |
-| `--pack-brightness` | Brightness multiplier for KO textures (default 1.6) |
+| `--pack-resolution` | Pixels per block in the texture pack (default 32, KO's own detail) |
+| `--pack-brightness` | Brightness multiplier for KO textures (default 1.3) |
 | `--texture-map FILE` | JSON of extra `"texture regex": "block"` rules |
 | `--preview` | Also render the previews |
 
@@ -80,14 +80,19 @@ Put the `.gtt` files from your KO client's `Data/dtex` folder into `dtex/` (see 
 python -m ko2mc gtd/moradon.gtd --ko-textures "../knight-online-minecraft-conversion-plugin-directory/additions/USKO Moradon Patch (v1298)/Client/DTex"
 ```
 
-That folder covers 43 of the 48 maps here. `In_dungeon06`, `dungeon_a`, `dungeon_defense`, `eslantzone` and `war_a` also use newer (2013–2017) textures; tiles whose file is missing keep a normal Minecraft block. Use `--pack-brightness` (default 1.6) if the ground looks too dark or too bright.
+That folder covers 43 of the 48 maps here. `In_dungeon06`, `dungeon_a`, `dungeon_defense`, `eslantzone` and `war_a` also use newer (2013–2017) textures; tiles whose file is missing keep a normal Minecraft block. Use `--pack-brightness` (default 1.3) if the ground looks too dark or too bright.
 
 You get:
 
 - `output/KO_Moradon/resources.zip`: Minecraft applies it automatically when you open that world in singleplayer.
 - `output/KO_Moradon_KO_textures.zip`: a copy for your `resourcepacks` folder (for servers or other setups).
 
-How it works: a map can use up to ~480 different ground textures, far more than Minecraft has spare blocks. So each KO texture becomes one *note block state* (instrument + note), and the pack gives every state its own texture. Minecraft derives a note block's instrument from the block beneath it, so the matching block (stone, sand, wool...) is placed right under each textured block. That way the ground keeps its texture when you build next to it. Right-clicking a textured block changes its note, so it's best for exploring rather than survival.
+How it works:
+
+- The ground is rebuilt the way the KO client draws it: each 4 m tile has a base texture plus, on transition tiles, an overlay texture that is added on top (that's how grass fades into dirt), and each layer can be flipped or rotated.
+- Textures keep KO's scale: at true size one KO tile covers 4 x 4 blocks, so every block shows its own 32 x 32 pixel piece of the tile.
+- A map has thousands of different pieces, but a resource pack can only add about 800 new block looks (as *note block states*: instrument + note). Similar pieces are grouped and each group uses the real KO piece closest to the group's average.
+- Minecraft derives a note block's instrument from the block beneath it, so the matching block (stone, sand, wool...) is placed right under each textured block. That way the ground keeps its texture when you build next to it. Right-clicking a textured block changes its note, so it's best for exploring rather than survival.
 
 ## Previews
 

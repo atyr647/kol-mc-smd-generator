@@ -72,6 +72,7 @@ class MinecraftWorld:
         self.terrain_provider = None
         self.bounds = None  # (min_x, min_z, max_x, max_z) in blocks, inclusive
         self.spawn = (0, 100, 0)
+        self.player = None  # optional (x, y, z, yaw, pitch): where singleplayer starts, flying
         self.biome = "minecraft:plains"
         self._pending: list[tuple[np.ndarray, ...]] = []
         self._single: list[tuple[int, int, int, int]] = []
@@ -318,6 +319,32 @@ class MinecraftWorld:
                 },
             },
         }
+        if self.player:
+            px, py, pz, yaw, pitch = self.player
+            data["Player"] = {
+                "Pos": nbt.List(nbt.TAG_DOUBLE, [nbt.Double(px), nbt.Double(py), nbt.Double(pz)]),
+                "Rotation": nbt.List(nbt.TAG_FLOAT, [nbt.Float(yaw), nbt.Float(pitch)]),
+                "Motion": nbt.List(nbt.TAG_DOUBLE, [nbt.Double(0.0)] * 3),
+                "Dimension": "minecraft:overworld",
+                "playerGameType": nbt.Int(1),
+                "OnGround": nbt.Byte(0),
+                "abilities": {"flying": nbt.Byte(1), "mayfly": nbt.Byte(1), "instabuild": nbt.Byte(1),
+                              "invulnerable": nbt.Byte(1), "mayBuild": nbt.Byte(1),
+                              "flySpeed": nbt.Float(0.05), "walkSpeed": nbt.Float(0.1)},
+            }
         os.makedirs(self.world_dir, exist_ok=True)
         with gzip.open(os.path.join(self.world_dir, "level.dat"), "wb") as f:
             f.write(nbt.encode({"Data": data}))
+
+
+def set_player_view(world_dir: str, x: float, y: float, z: float, yaw: float = 0.0, pitch: float = 0.0):
+    """Rewrite a ko2mc world's level.dat so singleplayer starts at this spot, flying.
+
+    yaw: 0 = looking south (+z), 90 = west, 180 = north, 270 = east. pitch: + looks down.
+    """
+    with gzip.open(os.path.join(world_dir, "level.dat"), "rb") as f:
+        data = nbt.decode(f.read())["Data"]
+    w = MinecraftWorld(world_dir, data.get("LevelName", os.path.basename(world_dir)))
+    w.spawn = (data.get("SpawnX", 0), data.get("SpawnY", 100), data.get("SpawnZ", 0))
+    w.player = (x, y, z, yaw, pitch)
+    w._write_level_dat()

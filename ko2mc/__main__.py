@@ -54,11 +54,12 @@ def main():
     parser.add_argument("--simple-plants", action="store_true",
                         help="With --ko-models, use single Minecraft plants for grass, flowers and "
                              "reeds instead of turning their models into blocks")
-    parser.add_argument("--pack-resolution", type=int, default=64, choices=[16, 32, 64, 128, 256],
-                        help="Pixels per block texture in the resource pack (default 64)")
-    parser.add_argument("--pack-brightness", type=float, default=1.6,
+    parser.add_argument("--pack-resolution", type=int, default=32, choices=[16, 32, 64, 128],
+                        help="Pixels per block texture in the resource pack (default 32 = KO's "
+                             "own detail at true size)")
+    parser.add_argument("--pack-brightness", type=float, default=1.3,
                         help="Brighten KO textures; the KO client draws terrain brighter "
-                             "than the files store it (default 1.6)")
+                             "than the files store it (default 1.3)")
     parser.add_argument("--preview", action="store_true",
                         help="Also render the KO reference and Minecraft previews")
 
