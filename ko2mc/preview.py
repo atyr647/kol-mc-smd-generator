@@ -84,8 +84,13 @@ def _hillshade(h: np.ndarray, spacing: float) -> np.ndarray:
 class KOScene:
     """The original KO map in Minecraft block coordinates."""
 
-    def __init__(self, gtd_path: str, opd_path: str | None, cm: CoordMap | None = None):
+    def __init__(self, gtd_path: str, opd_path: str | None, cm: CoordMap | None = None,
+                 models_dir: str | None = None, textures_dir: str | None = None,
+                 brightness: float = 1.6):
         print(f"Loading KO map {gtd_path}")
+        self.models_dir = models_dir if models_dir and os.path.isdir(models_dir) else None
+        self.textures_dir = textures_dir if textures_dir and os.path.isdir(textures_dir) else None
+        self.brightness = brightness
         self.gtd = parse_gtd(gtd_path)
         self.opd = None
         if opd_path and os.path.exists(opd_path):
@@ -203,7 +208,103 @@ class KOScene:
             "categories": OBJECT_CATEGORIES,
             "events": events,
             "coords": cm.to_json(),
+            "terrainTex": self._terrain_texture(),
+            "models": self._models_data(),
         }
+
+    def _terrain_texture(self, px: int = 8) -> str | None:
+        """The KO ground textures baked into one image (px pixels per tile), as a JPEG data URL."""
+        if not self.textures_dir:
+            return None
+        from PIL import Image
+        from .ko_textures import TextureLibrary, tile_texture_key
+        gtd = self.gtd
+        lib = TextureLibrary(self.textures_dir)
+        n = gtd.heightmap_size - 1
+        small = {}
+        for idx in np.unique(gtd.tex1[:n, :n]):
+            key = tile_texture_key(gtd, int(idx))
+            rgba = lib.tile(*key) if key else None
+            if rgba is not None:
+                im = Image.fromarray(rgba[..., :3]).resize((px, px), Image.BOX)
+                small[int(idx)] = np.clip(np.asarray(im, np.float32) * self.brightness, 0, 255).astype(np.uint8)
+        if not small:
+            return None
+        names, grid = materials.material_grid(gtd)
+        fallback = np.array([materials.MATERIALS[m].ko_color for m in names], np.uint8)
+        img = np.zeros((n * px, n * px, 3), np.uint8)
+        for tx in range(n):
+            for tz in range(n):
+                tile = small.get(int(gtd.tex1[tx, tz]))
+                row = (n - 1 - tz) * px        # north up
+                if tile is None:
+                    img[row:row + px, tx * px:(tx + 1) * px] = fallback[grid[tx, tz]]
+                else:
+                    img[row:row + px, tx * px:(tx + 1) * px] = tile
+        buf = io.BytesIO()
+        Image.fromarray(img).save(buf, "JPEG", quality=85)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _models_data(self, max_tex: int = 128) -> dict | None:
+        """Real KO object models: unique meshes + textures + one matrix per placed part."""
+        if not self.models_dir or not self.opd:
+            return None
+        from PIL import Image
+        from . import ko_models as km
+        lib = km.ModelLibrary(self.models_dir)
+        cm = self.cm
+        # KO meters -> Minecraft coords as a 4x4 (column vectors)
+        A = np.diag([cm.blocks_per_meter, cm.vertical_scale, -cm.blocks_per_meter, 1.0])
+        A[1, 3] = cm.y_offset
+        A[2, 3] = cm.map_size_m * cm.blocks_per_meter
+        groups, tex_index, textures = {}, {}, []
+        for shape in self.opd.shapes:
+            if re.search(r"fx|smoke|fog|smog|collisioncube", shape.name.lower()):
+                continue
+            x, y, z, w = shape.rotation.x, shape.rotation.y, shape.rotation.z, shape.rotation.w
+            R = np.eye(4)
+            R[:3, :3] = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+            S = np.diag([shape.scale.x, shape.scale.y, shape.scale.z, 1.0])
+            T = np.eye(4)
+            T[:3, 3] = [shape.position.x, shape.position.y, shape.position.z]
+            base = A @ T @ R @ S
+            for part in shape.parts:
+                mesh = lib.mesh(part.name)
+                if mesh is None or len(mesh[1]) == 0 or part.dest_blend == 2:
+                    continue
+                tname = part.textures[0].lower() if part.textures else ""
+                if tname not in tex_index:
+                    rgba = lib.texture(tname) if tname else None
+                    if rgba is None:
+                        tex_index[tname] = -1
+                    else:
+                        im = Image.fromarray(rgba, "RGBA")
+                        if im.width > max_tex or im.height > max_tex:
+                            im.thumbnail((max_tex, max_tex), Image.BOX)
+                        tex_index[tname] = len(textures)
+                        textures.append("data:image/png;base64," + base64.b64encode(_png_bytes(np.asarray(im))).decode())
+                P = np.eye(4)
+                if part.pivot:
+                    P[:3, 3] = [part.pivot.x, part.pivot.y, part.pivot.z]
+                alpha = bool(part.render_flags & km.RF_ALPHABLENDING)
+                key = (part.name.lower(), tname, alpha)
+                groups.setdefault(key, []).append((base @ P).astype(np.float32).T.ravel())  # column-major
+        meshes = []
+        for (mname, tname, alpha), mats in groups.items():
+            verts, idx = lib.mesh(mname)
+            meshes.append({
+                "v": _b64(np.ascontiguousarray(verts[:, :3])),
+                "uv": _b64(np.ascontiguousarray(verts[:, 6:8])),
+                "i": _b64(idx.astype(np.uint16 if len(verts) < 65536 else np.uint32)),
+                "big": len(verts) >= 65536,
+                "t": tex_index.get(tname, -1),
+                "a": alpha,
+                "m": _b64(np.concatenate(mats)),
+            })
+        print(f"  KO models for the viewer: {len(meshes)} meshes, {len(textures)} textures")
+        return {"meshes": meshes, "textures": textures}
 
 
 def cm_tris(tris: np.ndarray, cm: CoordMap) -> np.ndarray:
@@ -467,10 +568,11 @@ def _crop_area_for_view(scene: "MCScene") -> tuple | None:
     return (sx - half, sz - half, sx + half - 1, sz + half - 1)
 
 
-def preview_ko(gtd_path, opd_path=None, out_dir="preview", scale=4, html=True):
+def preview_ko(gtd_path, opd_path=None, out_dir="preview", scale=4, html=True,
+               models_dir=None, textures_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     gtd = parse_gtd(gtd_path, verbose=False)
-    ko = KOScene(gtd_path, opd_path, CoordMap.for_map(gtd, scale))
+    ko = KOScene(gtd_path, opd_path, CoordMap.for_map(gtd, scale), models_dir, textures_dir)
     _save_png(ko.top_down(), os.path.join(out_dir, f"ko_{ko.name}_map.png"))
     if html:
         write_viewer(os.path.join(out_dir, f"ko_{ko.name}_3d.html"), f"KO {ko.name}", ko.viewer_data(), None)
@@ -504,7 +606,8 @@ def preview_compare(world_dir, out_dir=None, mc_jar=None, download=False, area=N
     c = info.get("coords")
     gtd = parse_gtd(gtd_path, verbose=False)
     cm = CoordMap(**c) if c else CoordMap.for_map(gtd, 4)
-    ko = KOScene(gtd_path, opd_path, cm)
+    ko = KOScene(gtd_path, opd_path, cm, info.get("ko_models"), info.get("ko_textures"),
+                 info.get("pack_brightness", 1.6))
     mc = MCScene(world_dir, mc_jar, download)
 
     ko_img = ko.top_down()
@@ -567,6 +670,8 @@ def main(argv=None):
     k.add_argument("-o", "--output", default="preview")
     k.add_argument("-s", "--scale", type=int, default=4, choices=[1, 2, 4])
     k.add_argument("--no-html", action="store_true")
+    k.add_argument("--ko-models", default=None, help="KO Object folder (.n3pmesh/.dxt) for real models")
+    k.add_argument("--ko-textures", default=None, help="KO DTex folder (.gtt) for real ground textures")
 
     for name, help_text in (("mc", "render a Minecraft world"), ("compare", "KO and Minecraft side by side")):
         m = sub.add_parser(name, help=help_text)
@@ -585,7 +690,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.cmd == "ko":
         from .__main__ import find_opd
-        preview_ko(a.gtd, a.opd or find_opd(a.gtd), a.output, a.scale, html=not a.no_html)
+        preview_ko(a.gtd, a.opd or find_opd(a.gtd), a.output, a.scale, html=not a.no_html,
+                   models_dir=a.ko_models, textures_dir=a.ko_textures)
     elif a.cmd == "mc":
         preview_mc(a.world, a.output, a.mc_jar, a.download_textures, a.area, html=not a.no_html)
     else:

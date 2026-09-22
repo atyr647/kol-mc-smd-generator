@@ -151,9 +151,58 @@ function buildKO() {
   g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
   g.setIndex(new THREE.BufferAttribute(idx, 1));
   g.computeVertexNormals();
-  const detail = noiseTexture();
-  koTerrain = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true, map: detail, side: THREE.DoubleSide }));
+  let terrainMat;
+  if (KO.terrainTex) {
+    // real KO ground textures, baked per tile
+    const uv2 = new Float32Array(n * n * 2);
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      uv2[(j * n + i) * 2] = i / (n - 1); uv2[(j * n + i) * 2 + 1] = j / (n - 1);
+    }
+    g.setAttribute("uv", new THREE.BufferAttribute(uv2, 2));
+    const t = new THREE.TextureLoader().load(KO.terrainTex);
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = 8;
+    terrainMat = new THREE.MeshLambertMaterial({ map: t, side: THREE.DoubleSide });
+  } else {
+    terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true, map: noiseTexture(), side: THREE.DoubleSide });
+  }
+  koTerrain = new THREE.Mesh(g, terrainMat);
   koScene.add(koTerrain);
+
+  // real KO object models
+  if (KO.models) {
+    const texs = KO.models.textures.map((url) => {
+      const t = new THREE.TextureLoader().load(url);
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.flipY = false;                         // Direct3D texture coordinates
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      return t;
+    });
+    const mats = new Map();
+    const grp = new THREE.Group();
+    for (const m of KO.models.meshes) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(f32(m.v), 3));
+      geo.setAttribute("uv", new THREE.BufferAttribute(f32(m.uv), 2));
+      const ib = b64bytes(m.i).buffer;
+      geo.setIndex(new THREE.BufferAttribute(m.big ? new Uint32Array(ib) : new Uint16Array(ib), 1));
+      geo.computeVertexNormals();
+      const key = m.t + (m.a ? "a" : "");
+      if (!mats.has(key)) {
+        mats.set(key, new THREE.MeshLambertMaterial({ map: m.t >= 0 ? texs[m.t] : null, color: m.t >= 0 ? 0xffffff : 0xb0a898,
+          side: THREE.DoubleSide, alphaTest: 0.5, transparent: false }));
+      }
+      const M = f32(m.m);
+      const count = M.length / 16;
+      const inst = new THREE.InstancedMesh(geo, mats.get(key), count);
+      const mat4 = new THREE.Matrix4();
+      for (let k = 0; k < count; k++) { mat4.fromArray(M, k * 16); inst.setMatrixAt(k, mat4); }
+      inst.computeBoundingSphere();
+      grp.add(inst);
+    }
+    koGroups.models = grp;
+    koScene.add(grp);
+  }
 
   // water
   const w = f32(KO.water);
@@ -643,9 +692,14 @@ function frame() {
   try {
     if (KO) buildKO();
     if (KO) {
-      addToggle("KO buildings / walls (collision mesh)", null, (v) => koGroups.buildings && (koGroups.buildings.visible = v));
-      addToggle("KO trees & plants", null, (v) => koGroups.vegetation && (koGroups.vegetation.visible = v));
-      addToggle("KO other objects", null, (v) => koGroups.objects && (koGroups.objects.visible = v));
+      const real = !!KO.models;
+      if (real) addToggle("KO 3D models (buildings, trees...)", null, (v) => koGroups.models.visible = v);
+      addToggle("KO collision mesh (server walls)", null, (v) => koGroups.buildings && (koGroups.buildings.visible = v), !real);
+      addToggle(real ? "KO object markers" : "KO trees & plants", null, (v) => {
+        if (koGroups.vegetation) koGroups.vegetation.visible = v;
+        if (real && koGroups.objects) koGroups.objects.visible = v;
+      }, !real);
+      if (!real) addToggle("KO other objects", null, (v) => koGroups.objects && (koGroups.objects.visible = v));
       addToggle("KO water", null, (v) => koGroups.water && (koGroups.water.visible = v));
       addToggle("Event labels", null, (v) => { labelsOn = v; if (koGroups.events) koGroups.events.visible = v; });
     }

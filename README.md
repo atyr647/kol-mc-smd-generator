@@ -5,8 +5,8 @@ Convert Knight Online `.gtd` (terrain) and `.opd` (object) map files into playab
 ## What it does
 
 - **Terrain**: reads the KO heightmap, the texture used on every tile, and the lakes/rivers, and builds solid Minecraft terrain with matching blocks and water.
-- **Buildings & walls**: built from the server collision mesh stored in the `.opd` file (walls, houses, bridges, the arena...).
-- **Objects**: trees, bushes, grass, flowers, rocks, lamps and flags from the KO object list.
+- **Buildings, walls & trees**: built from the real KO 3D models (`.n3pmesh` + `.dxt` from the client's `Object` folder), with each block picked to match the KO texture colour there. Without the models, the server collision mesh in the `.opd` is used as a rough fallback.
+- **Small plants**: grass, flowers and reeds from the KO object list become Minecraft plants.
 - **Events**: warp gates, bind points, gates, anvils, etc. become recognizable Minecraft markers.
 - **KO textures (optional)**: with the KO `.gtt` texture files, a resource pack paints the ground with the real KO textures.
 - **Previews**: top-down maps and an interactive 3D viewer of the KO map, the Minecraft world, or both side by side.
@@ -45,6 +45,7 @@ python -m ko2mc --preview gtd/moradon.gtd
 | `--gtd-only` | Terrain only, ignore the `.opd` |
 | `--no-objects` | Don't place trees, rocks, lamps, event markers |
 | `--no-buildings` | Don't build walls/buildings from the collision mesh |
+| `--ko-models DIR` | KO client `Object` folder (`.n3pmesh`, `.dxt`) for real buildings/trees (default: `object/` if it has any) |
 | `--ko-textures DIR` | Folder with KO `.gtt` files (default: `dtex/` if it has any) |
 | `--pack-resolution` | Pixels per block in the texture pack (default 64) |
 | `--pack-brightness` | Brightness multiplier for KO textures (default 1.6) |
@@ -58,6 +59,17 @@ Copy the world folder from `output/` into your Minecraft `saves` folder:
 - **macOS**: `~/Library/Application Support/minecraft/saves/`
 
 The converter prints where warp gates and bind points ended up, and how KO coordinates map to Minecraft ones.
+
+## Real KO buildings and trees (3D models)
+
+Every object in an `.opd` lists its model parts. With `--ko-models` pointing at the KO client's `Object` folder, each object is rebuilt from those models: parts are placed with the object's position, rotation and scale, the model surface is filled with blocks, and each block is the Minecraft block whose colour best matches the KO texture at that spot (leaves for green see-through parts like tree leaves). Grass, flowers and reeds stay single Minecraft plants.
+
+```bash
+C="../knight-online-minecraft-conversion-plugin-directory/additions/USKO Moradon Patch (v1298)/Client"
+python -m ko2mc gtd/moradon.gtd --ko-models "$C/Object" --ko-textures "$C/DTex"
+```
+
+The preview then also draws the KO side with the real textured models and ground textures, so the split-screen viewer compares like with like. With the full map this page is large (about 30 MB for Moradon); use `--area x1,z1,x2,z2` to focus on one spot.
 
 ## Real KO ground textures (resource pack)
 
@@ -113,7 +125,8 @@ ko2mc/
   materials.py    - texture name -> block rules
   converter.py    - KO -> Minecraft conversion
   mc_world.py     - Minecraft world writer (region files, level.dat)
-  ko_textures.py  - .gtt texture reader and resource pack writer
+  ko_textures.py  - .gtt/.dxt texture reader and resource pack writer
+  ko_models.py    - .n3pmesh model reader and model -> blocks
   nbt.py          - NBT reader/writer
   mca_reader.py   - reads worlds back for previews
   mc_textures.py  - Minecraft block textures for previews

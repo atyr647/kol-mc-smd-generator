@@ -752,6 +752,9 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         "size_blocks": size,
         "spawn": world.spawn,
         "resource_pack": "resources.zip" if pack_path else None,
+        "ko_textures": os.path.abspath(ko_textures) if ko_textures else None,
+        "ko_models": os.path.abspath(ko_models) if ko_models else None,
+        "pack_brightness": pack_brightness,
     }
     with open(os.path.join(world_dir, "ko2mc.json"), "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
