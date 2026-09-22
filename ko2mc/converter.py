@@ -558,7 +558,7 @@ def voxelize_collision(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorl
     return placed
 
 
-# Objects that stay simple single plants even when models are available
+# Objects that become single Minecraft plants instead of models with --simple-plants
 _SIMPLE_KINDS = {"grass", "flower", "sunflower", "reed", "mushroom"}
 
 
@@ -581,7 +581,7 @@ def _smooth_colors(keys: np.ndarray, sums: np.ndarray, cnt: np.ndarray) -> np.nd
 
 
 def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, cm: CoordMap,
-                    library) -> tuple[int, set]:
+                    library, simple_plants: bool = False) -> tuple[int, set]:
     """Build objects from their KO 3D models. Returns (blocks placed, ids of shapes built)."""
     from . import ko_models as km
 
@@ -592,7 +592,7 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
         name = shape.name.lower()
         if re.search(r"fx|smoke|fog|smog|collisioncube|alpha", name) or not shape.parts:
             continue
-        if classify_object(shape.name) in _SIMPLE_KINDS and not shape.is_event_object:
+        if simple_plants and classify_object(shape.name) in _SIMPLE_KINDS and not shape.is_event_object:
             continue
         if library.missing(shape):
             missing += 1
@@ -653,7 +653,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 vertical_scale: float | None = None, objects: bool = True,
                 buildings: bool = True, ko_textures: str | None = None,
                 pack_resolution: int = 64, pack_brightness: float = 1.6,
-                ko_models: str | None = None) -> str:
+                ko_models: str | None = None, simple_plants: bool = False) -> str:
     """Convert KO map files to a Minecraft world.
 
     Args:
@@ -671,6 +671,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         pack_brightness: Multiplier for KO texture colours (KO draws terrain brighter than stored).
         ko_models: Folder with the KO client's Object files (.n3pmesh + .dxt). If given,
             objects and buildings are built from their real 3D models.
+        simple_plants: With models, still use single Minecraft plants for grass/flowers/reeds.
 
     Returns:
         Path to the generated world directory.
@@ -711,7 +712,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     if opd and ko_models and (objects or buildings):
         from .ko_models import ModelLibrary
         print("\nBuilding objects from KO 3D models...")
-        n, built = voxelize_models(opd, terrain, world, cm, ModelLibrary(ko_models))
+        n, built = voxelize_models(opd, terrain, world, cm, ModelLibrary(ko_models), simple_plants)
         print(f"  Placed {n} blocks for {len(built)} objects")
     elif opd and buildings:
         print("\nVoxelizing collision mesh (buildings, walls, bridges)...")

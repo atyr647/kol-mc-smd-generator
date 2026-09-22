@@ -51,6 +51,9 @@ def main():
                         help="Folder with KO Object files (.n3pmesh models + .dxt textures); "
                              "builds houses, walls and trees from the real models "
                              "(default: ./object if it exists)")
+    parser.add_argument("--simple-plants", action="store_true",
+                        help="With --ko-models, use single Minecraft plants for grass, flowers and "
+                             "reeds instead of turning their models into blocks")
     parser.add_argument("--pack-resolution", type=int, default=64, choices=[16, 32, 64, 128, 256],
                         help="Pixels per block texture in the resource pack (default 64)")
     parser.add_argument("--pack-brightness", type=float, default=1.6,
@@ -110,6 +113,7 @@ def main():
         pack_resolution=args.pack_resolution,
         pack_brightness=args.pack_brightness,
         ko_models=args.ko_models,
+        simple_plants=args.simple_plants,
     )
 
     if args.preview:
