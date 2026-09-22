@@ -25,8 +25,13 @@ class Quaternion:
 
 @dataclass
 class ShapePart:
-    name: str = ""
+    name: str = ""                      # mesh file, e.g. object\\obj_x.n3pmesh
     textures: list[str] = field(default_factory=list)
+    pivot: "Vector3" = None             # part offset inside the shape
+    diffuse: tuple = (1.0, 1.0, 1.0, 1.0)
+    render_flags: int = 0
+    src_blend: int = 0
+    dest_blend: int = 0
 
 
 # Event type constants
@@ -159,7 +164,7 @@ def _read_shape(fp) -> Shape:
     (part_count,) = struct.unpack("<i", fp.read(4))
     for _ in range(part_count):
         part = ShapePart()
-        fp.read(12)  # pivot Vector3
+        part.pivot = _read_vector3(fp)
 
         # Part name
         part.name = _read_string(fp)
@@ -170,7 +175,9 @@ def _read_shape(fp) -> Shape:
         # Actually: Diffuse(16) + Ambient(16) + Specular(16) + Emissive(16) + Power(4) = 68
         # + dwColorOp(4) + dwColorArg1(4) + dwColorArg2(4) + nRenderFlags(4) + dwSrcBlend(4) + dwDestBlend(4) = 24
         # Total = 92
-        fp.read(92)  # __Material
+        mtl = fp.read(92)  # __Material
+        part.diffuse = struct.unpack_from("<4f", mtl, 0)
+        part.render_flags, part.src_blend, part.dest_blend = struct.unpack_from("<3I", mtl, 80)
 
         (tex_count,) = struct.unpack("<I", fp.read(4))
         fp.read(4)  # tex FPS

@@ -558,11 +558,102 @@ def voxelize_collision(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorl
     return placed
 
 
+# Objects that stay simple single plants even when models are available
+_SIMPLE_KINDS = {"grass", "flower", "sunflower", "reed", "mushroom"}
+
+
+def _smooth_colors(keys: np.ndarray, sums: np.ndarray, cnt: np.ndarray) -> np.ndarray:
+    """Average each block's colour with its neighbours (3x3x3), so walls get a few
+    consistent blocks instead of speckles from every little texture detail."""
+    tot_s = sums.copy()
+    tot_c = cnt.copy()
+    for dx in (-1, 0, 1):
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == dy == dz == 0:
+                    continue
+                nk = keys + (dx * 8192 + dz) * 1024 + dy
+                pos = np.clip(np.searchsorted(keys, nk), 0, len(keys) - 1)
+                hit = keys[pos] == nk
+                tot_s[hit] += sums[pos[hit]] * 0.5
+                tot_c[hit] += cnt[pos[hit]] * 0.5
+    return tot_s / tot_c[:, None]
+
+
+def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, cm: CoordMap,
+                    library) -> tuple[int, set]:
+    """Build objects from their KO 3D models. Returns (blocks placed, ids of shapes built)."""
+    from . import ko_models as km
+
+    size = cm.size_blocks
+    keys_l, col_l, cnt_l, leaf_l = [], [], [], []
+    built, missing = set(), 0
+    for i, shape in enumerate(opd.shapes):
+        name = shape.name.lower()
+        if re.search(r"fx|smoke|fog|smog|collisioncube|alpha", name) or not shape.parts:
+            continue
+        if classify_object(shape.name) in _SIMPLE_KINDS and not shape.is_event_object:
+            continue
+        if library.missing(shape):
+            missing += 1
+            continue
+        for tris, uvs, tex, part in library.shape_parts(shape):
+            if part.dest_blend == 2:          # additive glow effects, not solid
+                continue
+            mc = np.stack([cm.x(tris[..., 0]), cm.y(tris[..., 1]), cm.z(tris[..., 2])], -1)
+            alpha = bool(part.render_flags & km.RF_ALPHABLENDING) or (
+                tex is not None and (tex[..., 3] < 128).mean() > 0.05)
+            pts, rgb = km.sample_part(mc, uvs, tex, alpha)
+            if len(pts) == 0:
+                continue
+            v = np.floor(pts).astype(np.int64)
+            ok = (v[:, 0] >= 0) & (v[:, 0] < size) & (v[:, 2] >= 0) & (v[:, 2] < size)
+            v, rgb = v[ok], rgb[ok]
+            # leave the ground alone where the model is buried in it
+            ok = v[:, 1] >= terrain.top[v[:, 2], v[:, 0]]
+            v, rgb = v[ok], rgb[ok].astype(np.float64)
+            if len(v) == 0:
+                continue
+            key = (v[:, 0] * 8192 + v[:, 2]) * 1024 + (v[:, 1] - MIN_Y)
+            uk, inv = np.unique(key, return_inverse=True)
+            sums = np.zeros((len(uk), 3))
+            np.add.at(sums, inv, rgb)
+            cnt = np.bincount(inv, minlength=len(uk)).astype(np.float64)
+            green = (rgb[:, 1] > rgb[:, 0] * 1.05) & (rgb[:, 1] > rgb[:, 2] * 1.05)
+            leaf = np.bincount(inv, weights=(green & alpha).astype(float), minlength=len(uk))
+            keys_l.append(uk); col_l.append(sums); cnt_l.append(cnt); leaf_l.append(leaf)
+        built.add(i)
+        if len(built) % 1000 == 0:
+            print(f"    {len(built)} objects built...")
+    if not keys_l:
+        return 0, built
+    keys = np.concatenate(keys_l)
+    uk, inv = np.unique(keys, return_inverse=True)
+    sums = np.zeros((len(uk), 3))
+    np.add.at(sums, inv, np.concatenate(col_l))
+    cnt = np.bincount(inv, weights=np.concatenate(cnt_l))
+    leaf = np.bincount(inv, weights=np.concatenate(leaf_l)) > cnt * 0.5
+    rgb = _smooth_colors(uk, sums, cnt)
+    ids = np.zeros(len(uk), np.uint16)
+    for palette, mask in ((km.SOLID_PALETTE, ~leaf), (km.LEAF_PALETTE, leaf)):
+        if mask.any():
+            choice = palette.nearest(rgb[mask])
+            lut = np.array([world.block_id(km.block_state(n)) for n in palette.names], np.uint16)
+            ids[mask] = lut[choice]
+    y = uk % 1024 + MIN_Y
+    xz = uk // 1024
+    world.set_blocks(xz // 8192, y, xz % 8192, ids)
+    if missing:
+        print(f"  {missing} objects have model files missing; using simple stand-ins for them")
+    return len(uk), built
+
+
 def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 world_name: str = "KnightOnline", scale: int = 4,
                 vertical_scale: float | None = None, objects: bool = True,
                 buildings: bool = True, ko_textures: str | None = None,
-                pack_resolution: int = 64, pack_brightness: float = 1.6) -> str:
+                pack_resolution: int = 64, pack_brightness: float = 1.6,
+                ko_models: str | None = None) -> str:
     """Convert KO map files to a Minecraft world.
 
     Args:
@@ -578,6 +669,8 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
             If given, a resource pack with the real KO ground textures is made.
         pack_resolution: Pixel size of each block texture in the resource pack.
         pack_brightness: Multiplier for KO texture colours (KO draws terrain brighter than stored).
+        ko_models: Folder with the KO client's Object files (.n3pmesh + .dxt). If given,
+            objects and buildings are built from their real 3D models.
 
     Returns:
         Path to the generated world directory.
@@ -614,17 +707,24 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     water_cols = int((terrain.water_top > terrain.top).sum())
     print(f"  Surface Y range {terrain.top.min()}..{terrain.top.max()}, {water_cols} water columns")
 
-    if opd and buildings:
+    built = set()
+    if opd and ko_models and (objects or buildings):
+        from .ko_models import ModelLibrary
+        print("\nBuilding objects from KO 3D models...")
+        n, built = voxelize_models(opd, terrain, world, cm, ModelLibrary(ko_models))
+        print(f"  Placed {n} blocks for {len(built)} objects")
+    elif opd and buildings:
         print("\nVoxelizing collision mesh (buildings, walls, bridges)...")
         n = voxelize_collision(opd, terrain, world, cm)
         print(f"  Placed {n} blocks from {opd.collision_face_count} collision faces")
 
     spawn = (size // 2, None, size // 2)
     if opd and objects:
-        print(f"\nPlacing {len(opd.shapes)} objects...")
+        print(f"\nPlacing {len(opd.shapes) - len(built)} simple objects...")
         placer = ObjectPlacer(world, terrain, cm)
-        for shape in opd.shapes:
-            placer.place(shape)
+        for i, shape in enumerate(opd.shapes):
+            if i not in built:
+                placer.place(shape)
         print("  " + ", ".join(f"{k}: {v}" for k, v in sorted(placer.counts.items())))
         binds = [s for s in opd.shapes if s.is_event_object and s.event_type in (OBJECT_BIND, OBJECT_WARP_GATE)]
         if binds:

@@ -47,6 +47,10 @@ def main():
                         help="Folder with KO .gtt terrain textures (client Data/dtex); "
                              "makes a resource pack with the real KO ground textures "
                              "(default: ./dtex if it exists)")
+    parser.add_argument("--ko-models", default=None, metavar="DIR",
+                        help="Folder with KO Object files (.n3pmesh models + .dxt textures); "
+                             "builds houses, walls and trees from the real models "
+                             "(default: ./object if it exists)")
     parser.add_argument("--pack-resolution", type=int, default=64, choices=[16, 32, 64, 128, 256],
                         help="Pixels per block texture in the resource pack (default 64)")
     parser.add_argument("--pack-brightness", type=float, default=1.6,
@@ -67,6 +71,13 @@ def main():
         for folder in (guess, "dtex"):
             if os.path.isdir(folder) and any(f.lower().endswith(".gtt") for f in os.listdir(folder)):
                 args.ko_textures = os.path.normpath(folder)
+                break
+
+    if args.ko_models is None:
+        guess = os.path.join(os.path.dirname(os.path.abspath(args.gtd_file)), "..", "object")
+        for folder in (guess, "object"):
+            if os.path.isdir(folder) and any(f.lower().endswith(".n3pmesh") for f in os.listdir(folder)):
+                args.ko_models = os.path.normpath(folder)
                 break
 
     if args.texture_map:
@@ -98,6 +109,7 @@ def main():
         ko_textures=args.ko_textures,
         pack_resolution=args.pack_resolution,
         pack_brightness=args.pack_brightness,
+        ko_models=args.ko_models,
     )
 
     if args.preview:

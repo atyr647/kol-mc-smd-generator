@@ -110,6 +110,7 @@ orbit.dampingFactor = 0.12;
 orbit.screenSpacePanning = false;
 orbit.maxPolarAngle = Math.PI * 0.495;
 const fly = new PointerLockControls(camera, document.body);
+window.viewer = { camera, orbit };   // handy for scripting screenshots from the console
 
 const size = KO ? KO.size : Math.max(MC.W, MC.D);
 const centerX = KO ? KO.size / 2 : MC.x0 + MC.W / 2;
