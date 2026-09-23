@@ -5,8 +5,9 @@ Convert Knight Online `.gtd` (terrain) and `.opd` (object) map files into playab
 ## What it does
 
 - **Terrain**: reads the KO heightmap, the texture used on every tile, and the lakes/rivers, and builds solid Minecraft terrain with matching blocks and water.
-- **Buildings, walls & trees**: built from the real KO 3D models (`.n3pmesh` + `.dxt` from the client's `Object` folder), with each block picked to match the KO texture colour there. Without the models, the server collision mesh in the `.opd` is used as a rough fallback.
-- **Plants**: grass, flowers and reeds become blocks from their models too (or Minecraft plants without models / with `--simple-plants`).
+- **Buildings, walls & trees**: built from the real KO 3D models (`.n3pmesh` + `.dxt` from the client's `Object` folder), and every block shows the real KO texture through the resource pack. Without the models, the server collision mesh in the `.opd` is used as a rough fallback.
+- **Plants**: grass, flowers and reeds become crossed plant sprites with their KO textures.
+- **Server plugin**: `plugin/ko2mc-blocks` keeps the KO-textured blocks stable on a Paper server.
 - **Events**: warp gates, bind points, gates, anvils, etc. become recognizable Minecraft markers.
 - **KO textures (optional)**: with the KO `.gtt` texture files, a resource pack paints the ground with the real KO textures.
 - **Previews**: top-down maps and an interactive 3D viewer of the KO map, the Minecraft world, or both side by side.
@@ -46,7 +47,8 @@ python -m ko2mc --preview gtd/moradon.gtd
 | `--no-objects` | Don't place trees, rocks, lamps, event markers |
 | `--no-buildings` | Don't build walls/buildings from the collision mesh |
 | `--ko-models DIR` | KO client `Object` folder (`.n3pmesh`, `.dxt`) for real buildings/trees (default: `object/` if it has any) |
-| `--simple-plants` | With models: grass/flowers/reeds as single Minecraft plants |
+| `--simple-plants` | With models: grass/flowers/reeds as normal Minecraft plants |
+| `--vanilla-blocks` | With models: normal Minecraft blocks picked by colour instead of KO textures |
 | `--ko-textures DIR` | Folder with KO `.gtt` files (default: `dtex/` if it has any) |
 | `--pack-resolution` | Pixels per block in the texture pack (default 32, KO's own detail) |
 | `--pack-brightness` | Brightness multiplier for KO textures (default 1.3) |
@@ -63,14 +65,18 @@ The converter prints where warp gates and bind points ended up, and how KO coord
 
 ## Real KO buildings and trees (3D models)
 
-Every object in an `.opd` lists its model parts. With `--ko-models` pointing at the KO client's `Object` folder, each object is rebuilt from those models: parts are placed with the object's position, rotation and scale, the model surface is filled with blocks, and each block is the Minecraft block whose colour best matches the KO texture at that spot (leaves for green see-through parts like tree leaves). To keep buildings clean and walkable:
+Every object in an `.opd` lists its model parts. With `--ko-models` pointing at the KO client's `Object` folder, each object is rebuilt from those models: parts are placed with the object's position, rotation and scale, and the model surface is filled with blocks.
 
-- Each KO texture is split into a few large colour patches (roof tiles, wall, wooden beams...), and every block takes its patch's block, so walls look consistent instead of speckled. Wood-looking blocks (logs, planks, hay) are only used for textures whose names suggest wood.
-- Floors, platforms and stair treads snap to half-block heights (slabs), and low ones are filled solid down to the ground.
-- Where a walkable surface rises by exactly one block, the edge becomes a stairs block, so you can walk up without jumping.
-- Diagonal gaps in walls and roofs are closed.
+**Every block shows the real KO texture.** For each block the converter remembers which KO texture it came from and which piece of that texture it covers. Those pieces become block textures in the resource pack:
 
-Every model is converted, including grass, flowers and reeds; add `--simple-plants` to use single Minecraft plants for those instead. Effect objects (glows, smoke, sparkles) are skipped because they aren't solid.
+- **Walls, roofs, floors:** about 650 building looks. Similar pieces are grouped and each group uses the real KO piece closest to its average, so a wall shows KO's stone, tiles, wood beams and windows.
+- **Leaves and see-through parts** (tree leaves, bushes, railings, grates): leaf blocks with KO textures, so they stay see-through.
+- **Grass, flowers and reeds:** crossed plant sprites with the real KO plant texture, like Minecraft's grass (up to 2 blocks tall). Big grass patches become scattered tufts.
+- **Steps:** floors, platforms and stair treads snap to half-block heights (slabs), low ones are filled solid down to the ground, and one-block rises become stairs, all with KO textures.
+
+Minecraft can't be sent brand-new blocks, so, like the ItemsAdder/Oraxen plugins, the pack gives existing block states new looks: unused note block, mushroom block, glazed terracotta, wool, ore and stone variants, leaves, tripwire, and the stairs/slab types. Those blocks look different everywhere in that world (for example, wool you place yourself shows a KO texture). See `ko2mc/custom_blocks.py` for the full list.
+
+Add `--vanilla-blocks` to build objects from normal Minecraft blocks picked by colour instead, and `--simple-plants` for normal Minecraft grass and flowers. Effect objects (glows, smoke, sparkles) are skipped because they aren't solid.
 
 ```bash
 C="../knight-online-minecraft-conversion-plugin-directory/additions/USKO Moradon Patch (v1298)/Client"
@@ -78,6 +84,23 @@ python -m ko2mc gtd/moradon.gtd --ko-models "$C/Object" --ko-textures "$C/DTex"
 ```
 
 The preview then also draws the KO side with the real textured models and ground textures, so the split-screen viewer compares like with like. With the full map this page is large (about 30 MB for Moradon); use `--area x1,z1,x2,z2` to focus on one spot.
+
+### Server plugin (recommended for servers)
+
+Vanilla Minecraft changes some block states by itself: leaves track their distance to logs, a note block's instrument follows the block under it, tripwire reacts to things walking through it. Each change would swap the KO texture. Singleplayer is fine as long as you don't build right next to KO blocks; on a server, install the plugin in `plugin/ko2mc-blocks` (Paper 1.20.4):
+
+```bash
+cd plugin/ko2mc-blocks
+mvn package                     # builds target/ko2mc-blocks-1.0.0.jar
+```
+
+Copy the jar into your Paper server's `plugins` folder and use the converted world plus its `resources.zip` as the server resource pack. The plugin:
+
+- puts back any KO block whose state changes because of something nearby (placing, breaking, explosions, pistons, water, redstone...);
+- stops right-clicks from re-tuning note blocks, and walking through plant sprites from triggering them;
+- stops leaves from decaying.
+
+Breaking and placing blocks still works normally. `plugins/KO2MC-Blocks/config.yml` lists the protected blocks and has on/off switches.
 
 ## Real KO ground textures (resource pack)
 
@@ -139,12 +162,16 @@ ko2mc/
   converter.py    - KO -> Minecraft conversion
   mc_world.py     - Minecraft world writer (region files, level.dat)
   ko_textures.py  - .gtt/.dxt texture reader and resource pack writer
-  ko_models.py    - .n3pmesh model reader and model -> blocks
+  ko_models.py    - .n3pmesh model reader
+  ko_objects.py   - models -> KO-textured blocks, plant sprites, steps
+  ko_ground.py    - KO ground (base + overlay textures) for the pack
+  custom_blocks.py - which block states carry KO textures
   nbt.py          - NBT reader/writer
   mca_reader.py   - reads worlds back for previews
   mc_textures.py  - Minecraft block textures for previews
   preview.py      - preview command line
   viewer.html     - 3D viewer template
+plugin/ko2mc-blocks/ - Paper server plugin that keeps KO blocks stable
 SMDExporter/      - original C++ server map (.gsmd) generator
 ```
 
