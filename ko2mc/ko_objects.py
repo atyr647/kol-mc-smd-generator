@@ -401,6 +401,12 @@ def _texture_looks(v, members, textures, budget, seed, alpha):
             order = np.argsort(-weight)
             alloc = np.zeros_like(need)
             alloc[order[:budget]] = 1
+        # hand out what rounding left over, one look at a time to the most starved texture
+        spare = budget - int(alloc.sum())
+        while spare > 0 and (alloc < need).any():
+            starved = np.where(alloc < need, weight / (alloc + 1), -1)
+            alloc[int(starved.argmax())] += 1
+            spare -= 1
     look_of_unit = np.full(len(keys), -1, np.int64)
     out_imgs, out_feat = [], []
     for t, k in zip(tids, alloc):

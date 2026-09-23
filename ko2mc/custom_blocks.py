@@ -7,9 +7,10 @@ converted world uses them:
 
   ground   note block states (instrument + note); the block underneath keeps the
            instrument stable (see ko_textures.py)
-  solid    ~1000 full-cube states: rarely used decorative blocks (glazed
+  solid    ~1450 full-cube states: rarely used decorative blocks (glazed
            terracotta, mushroom blocks, wool, ores, stone variants, chiseled
-           bookshelves, barrels, beehives...) plus the mob-head note block instruments
+           bookshelves, barrels, beehives, command blocks, logs, stained glass...),
+           double slabs, and the note block instruments the ground doesn't use
   foliage  leaf states (see-through like leaves, but with KO leaf textures)
   plant    tripwire states drawn as crossed plant sprites (KO grass and flowers)
   stairs / slab   stairs and slab block types re-textured with KO step textures
@@ -81,6 +82,18 @@ PROP_HOSTS = {
     "podzol": {"snowy": ("false", "true")},
     "mycelium": {"snowy": ("false", "true")},
     "infested_deepslate": {"axis": ("x", "y", "z")},
+    "carved_pumpkin": {"facing": ("north", "south", "west", "east")},
+    "sculk_catalyst": {"bloom": ("false", "true")},
+    # operator-only blocks: nobody places or breaks them in survival
+    **{b: {"conditional": ("false", "true"), "facing": ("north", "east", "south", "west", "up", "down")}
+       for b in ("command_block", "chain_command_block", "repeating_command_block")},
+    "structure_block": {"mode": ("save", "load", "corner", "data")},
+    "jigsaw": {"orientation": ("down_east", "down_north", "down_south", "down_west", "up_east", "up_north",
+                               "up_south", "up_west", "west_up", "east_up", "north_up", "south_up")},
+    **{b: {"axis": ("x", "y", "z")} for b in
+       ["acacia_log", "dark_oak_log", "mangrove_log", "crimson_stem", "warped_stem"]
+       + [f"stripped_{w}_log" for w in ("oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove")]
+       + ["stripped_crimson_stem", "stripped_warped_stem"]},
 }
 # more single-state cubes (after the ones above in priority: some have a light or a tool GUI)
 EXTRA_SINGLE_HOSTS = [
@@ -88,9 +101,9 @@ EXTRA_SINGLE_HOSTS = [
     "dead_horn_coral_block", "infested_stone", "infested_cobblestone", "infested_stone_bricks",
     "infested_mossy_stone_bricks", "infested_cracked_stone_bricks", "infested_chiseled_stone_bricks",
     "wet_sponge", "melon", "soul_soil", "crimson_nylium", "warped_nylium", "sculk",
-    "cartography_table", "fletching_table", "smithing_table", "crafting_table",
-]
-MOB_INSTRUMENTS = ["zombie", "skeleton", "creeper", "dragon", "wither_skeleton", "piglin", "custom_head"]
+    "cartography_table", "fletching_table", "smithing_table", "crafting_table", "mud", "tinted_glass",
+] + [f"{c}_stained_glass" for c in COLORS]
+MOB_INSTRUMENTS = ["pling", "zombie", "skeleton", "creeper", "dragon", "wither_skeleton", "piglin", "custom_head"]
 
 LEAF_HOSTS = ["oak_leaves", "spruce_leaves", "birch_leaves", "jungle_leaves", "acacia_leaves",
               "dark_oak_leaves", "mangrove_leaves", "cherry_leaves", "azalea_leaves", "flowering_azalea_leaves"]
@@ -139,19 +152,28 @@ def solid_slots():
     for b, props in PROP_HOSTS.items():
         for d in _combos(props):
             out.append((_state(b, d), b, [_key(d)]))
+    # note block instruments the ground doesn't use (mob heads, pling): the instrument only
+    # changes when something next to the note block changes
     for inst in MOB_INSTRUMENTS:
-        for note in range(25):
-            ks = [f"instrument={inst},note={note},powered={p}" for p in ("false", "true")]
-            out.append((f"minecraft:note_block[instrument={inst},note={note},powered=false]", "note_block", ks))
+        for powered in ("false", "true"):
+            for note in range(25):
+                st = f"instrument={inst},note={note},powered={powered}"
+                out.append((f"minecraft:note_block[{st}]", "note_block", [st]))
+    # double slabs are full blocks too
+    for t in STAIR_SLAB_TYPES:
+        out.append((f"minecraft:{t}_slab[type=double,waterlogged=false]", f"{t}_slab",
+                    ["type=double,waterlogged=false", "type=double,waterlogged=true"]))
     return out
 
 
 def foliage_slots():
     out = []
-    for b in LEAF_HOSTS:
-        for dist in range(1, 8):
-            ks = [f"distance={dist},persistent={p},waterlogged={w}" for p in ("false", "true") for w in ("false", "true")]
-            out.append((f"minecraft:{b}[distance={dist},persistent=true,waterlogged=false]", b, ks))
+    for p in ("true", "false"):
+        for b in LEAF_HOSTS:
+            # non-persistent leaves at distance 7 decay, so those states are left alone
+            for dist in range(1, 8 if p == "true" else 7):
+                ks = [f"distance={dist},persistent={p},waterlogged={w}" for w in ("false", "true")]
+                out.append((f"minecraft:{b}[distance={dist},persistent={p},waterlogged=false]", b, ks))
     return out
 
 

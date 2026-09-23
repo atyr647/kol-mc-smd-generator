@@ -369,6 +369,12 @@ class TexturePack:
                                                 {"model": "minecraft:block/note_block"})
             elif host in under_hosts:
                 pass                                   # every state already listed
+            elif host.endswith("_slab"):
+                # only the double slab carries a KO block look; half slabs keep their models
+                for half, suffix in (("bottom", ""), ("top", "_top")):
+                    for w in ("false", "true"):
+                        variants.setdefault(f"type={half},waterlogged={w}",
+                                            {"model": f"minecraft:block/{host}{suffix}"})
             else:
                 fallback = next(iter(variants.values()))
                 for k in cb.all_block_states(host):

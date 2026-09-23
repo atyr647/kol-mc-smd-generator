@@ -69,13 +69,13 @@ Every object in an `.opd` lists its model parts. With `--ko-models` pointing at 
 
 **Every block shows the real KO texture.** Each KO texture is cut into block-sized pieces (as big as one block is on the model), and every block shows the piece it covers, so a wall continues its texture from block to block the way KO draws it, with stone courses and trim bands lining up:
 
-- **Walls, roofs, floors:** about 1000 building looks. Textures on many blocks get more looks; a texture with fewer looks than pieces merges its most similar pieces. Looks are never shared between different textures, so every wall keeps its own material.
+- **Walls, roofs, floors:** about 1450 building looks, every spare full-block state vanilla Minecraft has. Textures on many blocks get more looks; a texture with fewer looks than pieces merges its most similar pieces. Looks are never shared between different textures, so every wall keeps its own material.
 - **Roofs:** steep roof slopes are built from stairs climbing the slope; gentle slopes and floors use half-block steps.
-- **Leaves and see-through parts** (tree leaves, railings, grates): leaf blocks with KO textures, so they stay see-through.
+- **Leaves and see-through parts** (tree leaves, railings, grates; 130 looks): leaf blocks with KO textures, so they stay see-through.
 - **Grass, flowers, reeds and small bushes:** crossed plant sprites with the real KO plant texture, like Minecraft's grass (up to 2 blocks tall). Big grass patches become scattered tufts.
 - **Steps:** floors, platforms and stair treads snap to half-block heights (slabs), low ones are filled solid down to the ground, and one-block rises become stairs, all with KO textures.
 
-Minecraft can't be sent brand-new blocks, so, like the ItemsAdder/Oraxen plugins, the pack gives existing block states new looks: unused note block, mushroom block, glazed terracotta, wool, ore and stone variants, chiseled bookshelf, barrel, beehive, furnace and dispenser states, leaves, tripwire, and the stairs/slab types. Those blocks look different everywhere in that world (for example, wool you place yourself shows a KO texture). See `ko2mc/custom_blocks.py` for the full list.
+Minecraft can't be sent brand-new blocks, so, like the ItemsAdder/Oraxen plugins, the pack gives existing block states new looks: unused note block, mushroom block, glazed terracotta, wool, ore and stone variants, chiseled bookshelf, barrel, beehive, furnace, dispenser and command block states, logs, stained glass, double slabs, leaves, tripwire, and the stairs/slab types. Those blocks look different everywhere in that world (for example, wool you place yourself shows a KO texture). See `ko2mc/custom_blocks.py` for the full list.
 
 Add `--vanilla-blocks` to build objects from normal Minecraft blocks picked by colour instead, and `--simple-plants` for normal Minecraft grass and flowers. Effect objects (glows, smoke, sparkles) are skipped because they aren't solid.
 
