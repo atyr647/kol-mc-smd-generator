@@ -81,8 +81,12 @@ def _kmeans_fit_assign(feat, k, seed=0, fit_max=120_000):
     return lab[inv], centres
 
 
-def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, seed=0):
-    """Place all objects as KO-textured blocks. Returns (blocks placed, ids of shapes built)."""
+def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, seed=0, on_shape=None):
+    """Place all objects as KO-textured blocks. Returns (blocks placed, ids of shapes built).
+
+    on_shape(i, keys): if given, called once per non-plant shape with the union of block
+    keys (see converter._key) that shape contributed, before the global winner-takes-all
+    step (so a neighbour may still have won a shared voxel). Used by qa_render.py."""
     from .converter import (FILL_BELOW_STEPS, MAX_Y, _close_diagonal_gaps, _key, _unkey,
                             classify_object)
 
@@ -100,10 +104,14 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
             textures.append(rgba)
         return tex_index[name]
 
+    cur_keys = []
+
     def add(keys, prio, tid, tx, ty, scale, dist, leaf, walk, face=-1):
         n = len(keys)
         if n == 0:
             return
+        if on_shape is not None:
+            cur_keys.append(keys)
         cols["key"].append(keys)
         cols["prio"].append(np.full(n, prio, np.int8))
         cols["tex"].append(np.full(n, tid, np.int32))
@@ -117,6 +125,7 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
         cols["face"].append(np.full(n, face, np.int8) if np.isscalar(face) else face.astype(np.int8))
 
     for i, shape in enumerate(opd.shapes):
+        cur_keys.clear()
         name = shape.name.lower()
         if re.search(r"fx|smoke|fog|smog|collisioncube|alpha", name) or not shape.parts:
             continue
@@ -143,7 +152,14 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
                 tname = f"#diffuse{tuple(c)}"
             else:
                 tname = part.textures[0].lower()
-            alpha = bool(part.render_flags & km.RF_ALPHABLENDING) or (tex[..., 3] < 128).mean() > 0.05
+            a8 = tex[..., 3]
+            # smoothly graduated alpha (many mid-range values) is a real blend effect (a
+            # glowing crystal, a translucent aura) that Minecraft can't render see-through;
+            # showing it solid, in its own colour, beats the alternative of a cutout test
+            # dropping most of it and leaving next to nothing behind
+            graduated = ((a8 > 20) & (a8 < 235)).mean() > 0.15
+            alpha = (not graduated) and (bool(part.render_flags & km.RF_ALPHABLENDING)
+                                         or (a8 < 128).mean() > 0.05)
             tid = tex_id(tname, tex)
             scale = _texel_scale(mc, uvs, tex.shape)
             pts, tri, tx, ty = km.sample_part(mc, uvs, tex, alpha)
@@ -182,20 +198,25 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
                 half = (q % 1) != 0
                 ty_ = np.where(half, np.floor(q), q - 1).astype(np.int64)
                 x_, z_, g = vx[top], vz[top], ground[top]
-                keep = ty_ > g
                 d = np.hypot(pts[top, 0] - x_ - 0.5, pts[top, 2] - z_ - 0.5)
                 # steep roofs (26-45 degrees): stairs climbing the slope; gentler slopes keep
                 # half/full steps
                 steep = (ny < 0.9)[tri[top]]
                 sy = np.floor(pts[top, 1] - 0.5).astype(np.int64)
                 ty_ = np.where(steep, sy, ty_)
-                keep = ty_ > g
+                # >= (not >): a flat decal painted right at ground level (a field line, a
+                # carpet) should still show, not get silently dropped for tying the terrain
+                keep = ty_ >= g
                 uphill = _facing(-nrm[tri[top], 0], -nrm[tri[top], 2])
                 for m, prio, face in ((keep & ~half & ~steep, FULL, -1), (keep & half & ~steep, SLAB, -1),
                                       (keep & steep, STAIR, uphill)):
                     add(_key(x_[m], ty_[m], z_[m]), prio, tid, txf[top][m], tyf[top][m], scale, d[m], False,
                         prio == FULL, face if np.isscalar(face) else face[m])
-                low = keep & (ty_ - g <= FILL_BELOW_STEPS)
+                # small perched decorations (signs, plaques, pots) aren't floors and don't
+                # need a support pillar down to natural ground -- they usually rest on another
+                # object's roof/ledge, which the ground reference here can't see
+                small = max(x_.max() - x_.min(), z_.max() - z_.min()) < 4
+                low = keep & (ty_ - g <= FILL_BELOW_STEPS) & (not small)
                 if low.any():
                     idx = np.flatnonzero(low)
                     cols_ = np.stack([x_[idx], z_[idx], ty_[idx], g[idx]], 1)
@@ -209,6 +230,8 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
                         add(_key(cols_[rep, 0], fy, cols_[rep, 1]), FULL, tid, txf[top][idx[rep]],
                             tyf[top][idx[rep]], scale, np.full(len(rep), 5.0), False, False)
         built.add(i)
+        if on_shape is not None:
+            on_shape(i, np.unique(np.concatenate(cur_keys)) if cur_keys else np.empty(0, np.int64))
         if len(built) % 2000 == 0:
             print(f"    {len(built)} objects built...")
 
@@ -321,12 +344,10 @@ def _pow2_cells(size, scale):
     return np.clip(2 ** np.round(np.log2(n)), 1, MAX_CELLS).astype(np.int64)
 
 
-def _cell_image(tex, gx, gy, cx, cy, alpha):
-    """One block look: piece (cx, cy) of a texture cut into gx x gy pieces, PIECE px square."""
+def _cell_image(tex, x0, x1, y0, y1, alpha):
+    """One block look: the tex[y0:y1, x0:x1] region, resampled to PIECE x PIECE."""
     h, w = tex.shape[:2]
-    x0, x1 = cx * w // gx, (cx + 1) * w // gx
-    y0, y1 = cy * h // gy, (cy + 1) * h // gy
-    crop = tex[y0:max(y1, y0 + 1), x0:max(x1, x0 + 1)]
+    crop = tex[max(y0, 0):min(max(y1, y0 + 1), h), max(x0, 0):min(max(x1, x0 + 1), w)]
     ch, cw = crop.shape[:2]
     # area-average (or repeat) to PIECE x PIECE
     ys = (np.arange(PIECE + 1) * ch / PIECE).astype(np.int64)
@@ -363,25 +384,43 @@ def _texture_looks(v, members, textures, budget, seed, alpha):
     tex = v["tex"][members]
     scale, scale_y = v["scale"][members], v["scale_y"][members]
     units, unit_of = {}, np.empty(len(members), np.int64)
+    unit_bbox = {}   # unit id -> (x0, x1, y0, y1) in texel space, from the samples that use it
     for t in np.unique(tex):
         m = np.flatnonzero(tex == t)
         h, w = textures[t].shape[:2]
         gx = _pow2_cells(w, scale[m])
         gy = _pow2_cells(h, scale_y[m])
-        cx = (np.mod(v["tx"][members[m]], w) * gx // w).astype(np.int64)
-        cy = (np.mod(v["ty"][members[m]], h) * gy // h).astype(np.int64)
+        mtx = np.mod(v["tx"][members[m]], w)
+        mty = np.mod(v["ty"][members[m]], h)
+        cx = (mtx * gx // w).astype(np.int64)
+        cy = (mty * gy // h).astype(np.int64)
         key = ((gx * 64 + gy) * 64 + cx) * 64 + cy
         uk, inv = np.unique(key, return_inverse=True)
         for k in uk.tolist():
             units[(int(t), k)] = len(units)
-        unit_of[m] = np.array([units[(int(t), k)] for k in uk.tolist()])[inv.ravel()]
+        u_ids = np.array([units[(int(t), k)] for k in uk.tolist()])[inv.ravel()]
+        unit_of[m] = u_ids
+        # crop each look from where its own samples actually sample the texture, not a
+        # rigid grid slice -- a small prop (or one sharing a crowded sprite sheet) then
+        # shows only its own material, never a neighbouring, unrelated piece of the sheet
+        order = np.argsort(u_ids, kind="stable")
+        u_sorted = u_ids[order]
+        starts = np.flatnonzero(np.r_[True, u_sorted[1:] != u_sorted[:-1]])
+        ends = np.r_[starts[1:], len(u_sorted)]
+        pad = 3
+        for s0, s1 in zip(starts, ends):
+            idx = order[s0:s1]
+            uid = int(u_sorted[s0])
+            x0, x1 = int(mtx[idx].min()) - pad, int(mtx[idx].max()) + 1 + pad
+            y0, y1 = int(mty[idx].min()) - pad, int(mty[idx].max()) + 1 + pad
+            unit_bbox[uid] = (x0, x1, y0, y1)
     keys = list(units)
     count = np.bincount(unit_of, minlength=len(keys)).astype(np.float64)
     utex = np.array([t for t, _ in keys])
     imgs = []
-    for t, k in keys:
-        cy = k % 64; cx = (k // 64) % 64; gy = (k // 4096) % 64; gx = k // 262144
-        imgs.append(_cell_image(textures[t], gx, gy, cx, cy, alpha))
+    for u, (t, k) in enumerate(keys):
+        x0, x1, y0, y1 = unit_bbox[u]
+        imgs.append(_cell_image(textures[t], x0, x1, y0, y1, alpha))
     feat = np.stack([np.concatenate([_small(im), [im[..., 3].mean() / 4]]) for im in imgs])
 
     # share the budget: water-filling on sqrt(blocks) per texture, at least one look each

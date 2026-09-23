@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ko2mc QA</title>
+<style>
+  html, body { margin: 0; background: #24262b; font-family: -apple-system, Arial, sans-serif; }
+  #canvas { display: block; }
+  .label {
+    position: absolute; color: #e8e8ec; font-size: 13px; line-height: 1.35;
+    text-shadow: 0 1px 2px #000; pointer-events: none; white-space: pre;
+  }
+  .colhdr {
+    position: absolute; color: #9aa; font-size: 12px; text-align: center; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="labels"></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+const DATA = __DATA__;
+const CELL_W = DATA.cellW, CELL_H = DATA.cellH, LABEL_H = DATA.labelH, PAD = DATA.pad;
+const cols = 2; // KO | Voxel
+const rowW = cols * CELL_W + PAD;
+const rowH = CELL_H + LABEL_H;
+const canvas = document.getElementById('canvas');
+const W = rowW;
+const H = rowH * DATA.objects.length;
+canvas.width = W; canvas.height = H;
+canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+document.body.style.width = W + 'px';
+
+const renderer = new THREE.WebGLRenderer({canvas, antialias: true, preserveDrawingBuffer: true});
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.setScissorTest(true);
+renderer.setClearColor(0x24262b, 1);
+
+function b64bytes(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+const f32 = (s) => new Float32Array(b64bytes(s).buffer);
+
+const texCache = {};
+function tex(i) { return texCache[i]; }
+async function preloadTextures() {
+  await Promise.all(DATA.textures.map((url, i) => new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const t = new THREE.Texture(img);
+      t.magFilter = THREE.NearestFilter;
+      t.minFilter = THREE.NearestFilter;
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.needsUpdate = true;
+      texCache[i] = t;
+      resolve();
+    };
+    img.onerror = resolve;
+    img.src = url;
+  })));
+}
+
+function buildGroup(batches) {
+  const group = new THREE.Group();
+  for (const b of batches) {
+    if (b.n === 0) continue;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(f32(b.v), 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(f32(b.uv), 2));
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshLambertMaterial({
+      map: tex(b.tex), side: THREE.DoubleSide, transparent: true, alphaTest: 0.5,
+    });
+    group.add(new THREE.Mesh(geo, mat));
+  }
+  return group;
+}
+
+function frameCamera(scene, group, aspect) {
+  const box = new THREE.Box3().setFromObject(group);
+  const size = new THREE.Vector3(); box.getSize(size);
+  const center = new THREE.Vector3(); box.getCenter(center);
+  const radius = Math.max(size.length() * 0.5, 0.6);
+  const cam = new THREE.OrthographicCamera(-radius * aspect, radius * aspect, radius, -radius,
+                                            0.01, radius * 10);
+  const dir = new THREE.Vector3(1.1, 0.9, 1.1).normalize();
+  cam.position.copy(center.clone().add(dir.multiplyScalar(radius * 3)));
+  cam.lookAt(center);
+  cam.updateProjectionMatrix();
+  scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.75);
+  dl.position.set(4, 6, 3);
+  scene.add(dl);
+  return cam;
+}
+
+const labelsDiv = document.getElementById('labels');
+labelsDiv.style.position = 'absolute';
+labelsDiv.style.top = '0'; labelsDiv.style.left = '0';
+
+async function main() {
+await preloadTextures();
+DATA.objects.forEach((obj, row) => {
+  const y0 = H - (row + 1) * rowH; // three.js viewport y is bottom-up
+  // KO cell
+  {
+    const scene = new THREE.Scene();
+    const group = buildGroup(obj.ko);
+    scene.add(group);
+    const cam = frameCamera(scene, group, CELL_W / CELL_H);
+    renderer.setViewport(PAD, y0 + LABEL_H, CELL_W, CELL_H);
+    renderer.setScissor(PAD, y0 + LABEL_H, CELL_W, CELL_H);
+    renderer.render(scene, cam);
+  }
+  // Voxel cell
+  {
+    const scene = new THREE.Scene();
+    const group = buildGroup(obj.vox);
+    scene.add(group);
+    const cam = frameCamera(scene, group, CELL_W / CELL_H);
+    renderer.setViewport(PAD + CELL_W, y0 + LABEL_H, CELL_W, CELL_H);
+    renderer.setScissor(PAD + CELL_W, y0 + LABEL_H, CELL_W, CELL_H);
+    renderer.render(scene, cam);
+  }
+  const div = document.createElement('div');
+  div.className = 'label';
+  div.style.left = PAD + 'px';
+  div.style.top = (row * rowH + 4) + 'px';
+  div.style.width = (CELL_W * 2) + 'px';
+  div.textContent = obj.label;
+  labelsDiv.appendChild(div);
+  const ko_hdr = document.createElement('div');
+  ko_hdr.className = 'colhdr'; ko_hdr.textContent = 'KO original';
+  ko_hdr.style.left = PAD + 'px'; ko_hdr.style.top = (row * rowH + LABEL_H - 16) + 'px'; ko_hdr.style.width = CELL_W + 'px';
+  labelsDiv.appendChild(ko_hdr);
+  const vox_hdr = document.createElement('div');
+  vox_hdr.className = 'colhdr'; vox_hdr.textContent = 'Voxelized (final blocks)';
+  vox_hdr.style.left = (PAD + CELL_W) + 'px'; vox_hdr.style.top = (row * rowH + LABEL_H - 16) + 'px'; vox_hdr.style.width = CELL_W + 'px';
+  labelsDiv.appendChild(vox_hdr);
+});
+
+window.QA_READY = true;
+window.VIEWER_READY = true;
+}
+main().catch(e => { window.VIEWER_ERROR = String(e && e.stack || e); console.error(e); });
+</script>
+</body>
+</html>

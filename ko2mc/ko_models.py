@@ -270,16 +270,59 @@ def _from_lab(lab: np.ndarray) -> np.ndarray:
 
 
 def parse_n3pmesh(data: bytes):
-    """Return (vertices (N, 8) float32, triangle indices (M, 3) int)."""
+    """Return (vertices (N, 8) float32, triangle indices (M, 3) int).
+
+    CN3PMesh is a *progressive* mesh (ported from Open-KO's N3PMesh.cpp): the
+    stored index buffer is only the lowest-detail (most collapsed) state, not
+    a renderable triangle list. A live CN3PMeshInstance starts there and
+    SplitOne()s up to full detail, rewriting index slots to the vertices each
+    edge-split reveals -- so reading the stored indices directly gives a mesh
+    with most triangles referencing stale, pre-split vertex slots (visible as
+    "origami": faces cutting across the model instead of following its real
+    faces). We replay every split here to reconstruct the full-detail index
+    buffer, the same way the engine does.
+
+    Layout: name, nCollapses, nTotalIndexChanges, maxVerts, maxIndices,
+    minVerts, minIndices; maxVerts x (pos vec3, normal vec3 [unused -- we
+    recompute normals from geometry], uv vec2 = 32 bytes); maxIndices x
+    uint16 base indices; nCollapses x __EdgeCollapse (NumIndicesToLose,
+    NumIndicesToChange, NumVerticesToLose, iIndexChanges, CollapseTo,
+    bShouldCollapse (bool, padded) = 24 bytes); nTotalIndexChanges x int32
+    index-change table.
+    """
     (n,) = struct.unpack_from("<i", data, 0)
     off = 4 + n
-    _nc, _tic, max_v, max_i, _mnv, _mni = struct.unpack_from("<6i", data, off)
+    n_collapses, n_changes, max_v, max_i, min_v, min_i = struct.unpack_from("<6i", data, off)
     off += 24
-    verts = np.frombuffer(data, "<f4", max_v * 8, off).reshape(max_v, 8)
+    verts = np.frombuffer(data, "<f4", max_v * 8, off).reshape(max_v, 8).copy()
     off += max_v * 32
-    idx = np.frombuffer(data, "<u2", max_i, off).astype(np.int32)
+    idx = np.frombuffer(data, "<u2", max_i, off).astype(np.int32).copy()
+    off += max_i * 2
+
+    lose_i = np.empty(n_collapses, np.int64)
+    change_n = np.empty(n_collapses, np.int64)
+    lose_v = np.empty(n_collapses, np.int64)
+    i_change = np.empty(n_collapses, np.int64)
+    for c in range(n_collapses):
+        lose_i[c], change_n[c], lose_v[c], i_change[c] = struct.unpack_from("<4i", data, off)
+        off += 24
+    all_changes = (np.frombuffer(data, "<i4", n_changes, off).astype(np.int64)
+                  if n_changes else np.empty(0, np.int64))
+
+    # Replay every split (CN3PMeshInstance::SplitOne) to reach full detail: each
+    # collapse "undone" adds back lose_v[c] vertices and rewrites change_n[c]
+    # index slots (named in all_changes, starting at i_change[c]) to the newly
+    # revealed vertex.
+    num_v = min_v
+    for c in range(n_collapses):
+        num_v += lose_v[c]
+        base = max(int(i_change[c]), 0)
+        slots = all_changes[base:base + max(int(change_n[c]), 0)]
+        slots = slots[(slots >= 0) & (slots < len(idx))]
+        idx[slots] = min(max(num_v - 1, 0), max_v - 1)
+
     idx = idx[: len(idx) // 3 * 3].reshape(-1, 3)
-    idx = idx[(idx < max_v).all(1)]
+    idx = idx[(idx >= 0).all(1) & (idx < max_v).all(1)]
     return verts, idx
 
 
@@ -317,7 +360,7 @@ class ModelLibrary:
             path = self.files.get(k)
             try:
                 self._meshes[k] = parse_n3pmesh(open(path, "rb").read()) if path else None
-            except (struct.error, ValueError):
+            except (struct.error, ValueError, IndexError):
                 self._meshes[k] = None
         return self._meshes[k]
 
