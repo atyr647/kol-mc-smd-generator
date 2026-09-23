@@ -418,3 +418,6 @@ MigrationBackup/
 # ko2mc generated worlds and previews
 /output/
 /preview/
+
+# plugin build output
+plugin/*/target/

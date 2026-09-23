@@ -1,0 +1,13 @@
+name: KO2MC-Blocks
+version: 1.0.0
+main: dev.ko2mc.blocks.KOBlocksPlugin
+api-version: '1.20'
+description: Keeps the Knight Online textured blocks from ko2mc worlds stable on a server.
+commands:
+  ko2mc:
+    description: ko2mc tools (place a block like a player would, for testing)
+    usage: /ko2mc place <x> <y> <z> <block>
+    permission: ko2mc.admin
+permissions:
+  ko2mc.admin:
+    default: op

@@ -627,6 +627,34 @@ def _close_diagonal_gaps(keys: np.ndarray, ids: np.ndarray):
     return keys, ids
 
 
+def _add_stairs_facing(keys, walk, solid_mask, terrain, cm) -> dict:
+    """For walkable blocks with the ground exactly one lower in front and at least as
+    high behind, return {block key: stairs facing}. keys are all placed blocks."""
+    order = np.argsort(keys)
+    skeys, ssolid = keys[order], solid_mask[order]
+    size = cm.size_blocks
+
+    def solid(x, y, z):
+        inside = (x >= 0) & (x < size) & (z >= 0) & (z < size)
+        ground = np.full(len(x), -10_000, np.int64)
+        ground[inside] = terrain.top[np.clip(z, 0, size - 1), np.clip(x, 0, size - 1)][inside]
+        k = _key(x, y, z)
+        pos = np.clip(np.searchsorted(skeys, k), 0, len(skeys) - 1)
+        return (y <= ground) | ((skeys[pos] == k) & ssolid[pos])
+
+    wk = keys[walk]
+    if len(wk) == 0:
+        return {}
+    wx, wy, wz = _unkey(wk)
+    ok = ~solid(wx, wy + 1, wz) & ~solid(wx, wy + 2, wz)
+    out = {}
+    for (dx, dz), facing in (((0, 1), "north"), ((0, -1), "south"), ((1, 0), "west"), ((-1, 0), "east")):
+        m = ok & solid(wx + dx, wy - 1, wz + dz) & ~solid(wx + dx, wy, wz + dz) & solid(wx - dx, wy, wz - dz)
+        for k in wk[m].tolist():
+            out.setdefault(k, facing)
+    return out
+
+
 def _add_stairs(keys, ids, walk_keys, terrain, world, cm):
     """Turn one-block rises on walkable surfaces into stairs, so they can be walked up
     without jumping. A walkable block becomes stairs when the ground in front of it is
@@ -829,7 +857,8 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 vertical_scale: float | None = None, objects: bool = True,
                 buildings: bool = True, ko_textures: str | None = None,
                 pack_resolution: int = 32, pack_brightness: float = 1.3,
-                ko_models: str | None = None, simple_plants: bool = False) -> str:
+                ko_models: str | None = None, simple_plants: bool = False,
+                vanilla_blocks: bool = False) -> str:
     """Convert KO map files to a Minecraft world.
 
     Args:
@@ -848,6 +877,8 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         ko_models: Folder with the KO client's Object files (.n3pmesh + .dxt). If given,
             objects and buildings are built from their real 3D models.
         simple_plants: With models, still use single Minecraft plants for grass/flowers/reeds.
+        vanilla_blocks: Build objects from normal Minecraft blocks picked by colour instead
+            of KO-textured blocks from the resource pack.
 
     Returns:
         Path to the generated world directory.
@@ -875,10 +906,11 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     print(f"\nBuilding terrain ({size}x{size} blocks, scale={scale}, "
           f"vertical {cm.vertical_scale:.3f} blocks/m)...")
     pack = library = None
-    if ko_textures:
+    if ko_textures or (ko_models and not vanilla_blocks):
         from .ko_textures import TexturePack, TextureLibrary
-        library = TextureLibrary(ko_textures)
         pack = TexturePack(world_name, pack_resolution, pack_brightness)
+    if ko_textures:
+        library = TextureLibrary(ko_textures)
     terrain = TerrainModel(gtd, cm, world, pack, library)
     world.set_terrain(terrain.fill_chunk, (0, 0, size - 1, size - 1))
     water_cols = int((terrain.water_top > terrain.top).sum())
@@ -888,7 +920,11 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     if opd and ko_models and (objects or buildings):
         from .ko_models import ModelLibrary
         print("\nBuilding objects from KO 3D models...")
-        n, built = voxelize_models(opd, terrain, world, cm, ModelLibrary(ko_models), simple_plants)
+        if pack is not None and not vanilla_blocks:
+            from .ko_objects import build_objects
+            n, built = build_objects(opd, terrain, world, cm, ModelLibrary(ko_models), pack, simple_plants)
+        else:
+            n, built = voxelize_models(opd, terrain, world, cm, ModelLibrary(ko_models), simple_plants)
         print(f"  Placed {n} blocks for {len(built)} objects")
     elif opd and buildings:
         print("\nVoxelizing collision mesh (buildings, walls, bridges)...")
@@ -915,7 +951,7 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
     world.save()
 
     pack_path = None
-    if pack is not None and pack.images:
+    if pack is not None and not pack.empty:
         # resources.zip inside a world folder is applied automatically in singleplayer
         pack_path = os.path.join(world_dir, "resources.zip")
         pack.write(pack_path)

@@ -54,6 +54,9 @@ def main():
     parser.add_argument("--simple-plants", action="store_true",
                         help="With --ko-models, use single Minecraft plants for grass, flowers and "
                              "reeds instead of turning their models into blocks")
+    parser.add_argument("--vanilla-blocks", action="store_true",
+                        help="With --ko-models, build objects from normal Minecraft blocks "
+                             "(picked by colour) instead of KO-textured blocks")
     parser.add_argument("--pack-resolution", type=int, default=32, choices=[16, 32, 64, 128],
                         help="Pixels per block texture in the resource pack (default 32 = KO's "
                              "own detail at true size)")
@@ -115,6 +118,7 @@ def main():
         pack_brightness=args.pack_brightness,
         ko_models=args.ko_models,
         simple_plants=args.simple_plants,
+        vanilla_blocks=args.vanilla_blocks,
     )
 
     if args.preview:

@@ -182,7 +182,11 @@ class TextureLibrary:
 # ---------------------------------------------------------------------------
 
 class TexturePack:
-    """Collects custom block textures and writes a Minecraft resource pack."""
+    """Collects custom block textures and writes a Minecraft resource pack.
+
+    Ground textures use note block states (add()); objects use the host states in
+    custom_blocks.py (add_solid(), add_foliage(), add_plant(), set_stairs(), set_slab()).
+    """
 
     def __init__(self, title: str, resolution: int = 32, brightness: float = 1.3):
         self.title = title
@@ -190,9 +194,23 @@ class TexturePack:
         # The KO client lights terrain with "modulate 2x" (then darkens it with its
         # colour map), so stored textures are darker than they look in game.
         self.brightness = brightness
-        self.images: list[np.ndarray] = []
+        self.images: list[np.ndarray] = []        # ground
         self.names: list[str] = []
+        from . import custom_blocks as cb
+        self._solid_slots = cb.solid_slots()
+        self._foliage_slots = cb.foliage_slots()
+        self._plant_slots = cb.plant_slots()
+        self.solid: list[np.ndarray] = []         # object textures (already final colours)
+        self.foliage: list[np.ndarray] = []
+        self.plants: list[tuple[np.ndarray, int]] = []
+        self.stairs: dict[str, np.ndarray] = {}
+        self.slabs: dict[str, np.ndarray] = {}
 
+    @property
+    def empty(self) -> bool:
+        return not (self.images or self.solid or self.foliage or self.plants)
+
+    # ---- ground ----
     def add(self, rgba: np.ndarray, label: str) -> int | None:
         if len(self.images) >= MAX_CUSTOM:
             return None
@@ -200,50 +218,156 @@ class TexturePack:
         self.names.append(label)
         return len(self.images) - 1
 
+    # ---- objects ----
+    @property
+    def max_solid(self) -> int:
+        return len(self._solid_slots)
+
+    @property
+    def max_foliage(self) -> int:
+        return len(self._foliage_slots)
+
+    @property
+    def max_plants(self) -> int:
+        return len(self._plant_slots)
+
+    def add_solid(self, rgba: np.ndarray) -> str | None:
+        if len(self.solid) >= self.max_solid:
+            return None
+        self.solid.append(rgba)
+        return self._solid_slots[len(self.solid) - 1][0]
+
+    def add_foliage(self, rgba: np.ndarray) -> str | None:
+        if len(self.foliage) >= self.max_foliage:
+            return None
+        self.foliage.append(rgba)
+        return self._foliage_slots[len(self.foliage) - 1][0]
+
+    def add_plant(self, rgba: np.ndarray, height_px: int = 16) -> str | None:
+        if len(self.plants) >= self.max_plants:
+            return None
+        self.plants.append((rgba, int(np.clip(height_px, 4, 32))))
+        return self._plant_slots[len(self.plants) - 1][0]
+
+    def set_stairs(self, block_type: str, rgba: np.ndarray):
+        self.stairs[block_type] = rgba
+
+    def set_slab(self, block_type: str, rgba: np.ndarray):
+        self.slabs[block_type] = rgba
+
     def average_color(self, i: int) -> tuple[int, int, int]:
         return tuple(int(c) for c in self.images[i][..., :3].reshape(-1, 3).mean(0))
 
-    def _png(self, rgba: np.ndarray) -> bytes:
+    def _png(self, rgba: np.ndarray, brighten: bool = True, alpha: bool = False) -> bytes:
         from PIL import Image
-        rgb = np.clip(rgba[..., :3].astype(np.float32) * self.brightness, 0, 255).astype(np.uint8)
-        im = Image.fromarray(rgb, "RGB")   # terrain is opaque
+        f = self.brightness if brighten else 1.0
+        rgb = np.clip(rgba[..., :3].astype(np.float32) * f, 0, 255).astype(np.uint8)
+        if alpha:
+            a = rgba[..., 3] if rgba.shape[-1] == 4 else np.full(rgb.shape[:2], 255, np.uint8)
+            im = Image.fromarray(np.dstack([rgb, np.where(a >= 128, 255, 0).astype(np.uint8)]), "RGBA")
+        else:
+            im = Image.fromarray(rgb, "RGB")
         r = self.resolution
         if im.width != r or im.height != r:
-            im = im.resize((r, r), Image.BOX if im.width > r else Image.NEAREST)
+            im = im.resize((r, r), Image.NEAREST if alpha or im.width < r else Image.BOX)
         buf = io.BytesIO()
         im.save(buf, "PNG")
         return buf.getvalue()
 
     def write(self, path: str):
-        variants = {}
+        from . import custom_blocks as cb
+        ns = NAMESPACE
         files = {}
-        for i, (img, label) in enumerate(zip(self.images, self.names)):
+        states: dict[str, dict] = {}          # host block -> variant key -> model
+
+        def cube(name, tex, parent="minecraft:block/cube_all"):
+            files[f"assets/{ns}/models/block/{name}.json"] = json.dumps(
+                {"parent": parent, "textures": {"all": f"{ns}:block/{tex}"}})
+            return f"{ns}:block/{name}"
+
+        # ground: note block states with the instrument block underneath
+        for i, img in enumerate(self.images):
             state, _ = custom_state(i)
             props = state[state.index("[") + 1:-1]
-            model = f"{NAMESPACE}:block/t{i}"
-            variants[props] = {"model": model}
-            files[f"assets/{NAMESPACE}/models/block/t{i}.json"] = json.dumps(
-                {"parent": "minecraft:block/cube_all", "textures": {"all": f"{NAMESPACE}:block/t{i}"}})
-            files[f"assets/{NAMESPACE}/textures/block/t{i}.png"] = self._png(img)
-        # every other note block state keeps the normal look (all states must be listed)
-        for inst in ALL_INSTRUMENTS:
-            for note in range(NOTES):
-                for powered in ("false", "true"):
-                    variants.setdefault(f"instrument={inst},note={note},powered={powered}",
-                                        {"model": "minecraft:block/note_block"})
-        files["assets/minecraft/blockstates/note_block.json"] = json.dumps({"variants": variants}, indent=1)
+            states.setdefault("note_block", {})[props] = {"model": cube(f"t{i}", f"t{i}")}
+            files[f"assets/{ns}/textures/block/t{i}.png"] = self._png(img)
+        # solid object blocks
+        for i, img in enumerate(self.solid):
+            _, host, keys = self._solid_slots[i]
+            m = cube(f"o{i}", f"o{i}")
+            files[f"assets/{ns}/textures/block/o{i}.png"] = self._png(img, brighten=False)
+            for k in keys:
+                states.setdefault(host, {})[k] = {"model": m}
+        # foliage: leaf blocks (drawn see-through), no biome tint
+        for i, img in enumerate(self.foliage):
+            _, host, keys = self._foliage_slots[i]
+            m = cube(f"f{i}", f"f{i}")
+            files[f"assets/{ns}/textures/block/f{i}.png"] = self._png(img, brighten=False, alpha=True)
+            for k in keys:
+                states.setdefault(host, {})[k] = {"model": m}
+        # plants: tripwire drawn as two crossed sprites
+        for i, (img, h) in enumerate(self.plants):
+            _, host, keys = self._plant_slots[i]
+            t = f"{ns}:block/p{i}"
+            files[f"assets/{ns}/textures/block/p{i}.png"] = self._png(img, brighten=False, alpha=True)
+            plane = {"uv": [0, 0, 16, 16], "texture": "#cross"}
+            files[f"assets/{ns}/models/block/p{i}.json"] = json.dumps({
+                "ambientocclusion": False, "textures": {"particle": t, "cross": t},
+                "elements": [
+                    {"from": [0.8, 0, 8], "to": [15.2, h, 8], "shade": False,
+                     "rotation": {"origin": [8, 8, 8], "axis": "y", "angle": 45, "rescale": True},
+                     "faces": {"north": plane, "south": plane}},
+                    {"from": [8, 0, 0.8], "to": [8, h, 15.2], "shade": False,
+                     "rotation": {"origin": [8, 8, 8], "axis": "y", "angle": 45, "rescale": True},
+                     "faces": {"west": plane, "east": plane}}]})
+            for k in keys:
+                states.setdefault(host, {})[k] = {"model": f"{ns}:block/p{i}"}
+        # stairs and slabs: re-texture the vanilla models (keeps all rotations)
+        for t, img in self.stairs.items():
+            tex = f"{ns}:block/st_{t}"
+            files[f"assets/{ns}/textures/block/st_{t}.png"] = self._png(img, brighten=False)
+            for suffix, parent in (("", "stairs"), ("_inner", "inner_stairs"), ("_outer", "outer_stairs")):
+                files[f"assets/minecraft/models/block/{t}_stairs{suffix}.json"] = json.dumps(
+                    {"parent": f"minecraft:block/{parent}", "textures": {"bottom": tex, "top": tex, "side": tex}})
+        for t, img in self.slabs.items():
+            tex = f"{ns}:block/sl_{t}"
+            files[f"assets/{ns}/textures/block/sl_{t}.png"] = self._png(img, brighten=False)
+            for suffix, parent in (("_slab", "slab"), ("_slab_top", "slab_top")):
+                files[f"assets/minecraft/models/block/{t}{suffix}.json"] = json.dumps(
+                    {"parent": f"minecraft:block/{parent}", "textures": {"bottom": tex, "top": tex, "side": tex}})
+
+        # complete blockstates files: every state of a host must be listed
+        for host, variants in states.items():
+            if host == "note_block":
+                for inst in ALL_INSTRUMENTS:
+                    for note in range(NOTES):
+                        for powered in ("false", "true"):
+                            variants.setdefault(f"instrument={inst},note={note},powered={powered}",
+                                                {"model": "minecraft:block/note_block"})
+            else:
+                fallback = next(iter(variants.values()))
+                for k in cb.all_block_states(host):
+                    variants.setdefault(k, fallback)
+            files[f"assets/minecraft/blockstates/{host}.json"] = json.dumps({"variants": variants})
+
         files["pack.mcmeta"] = json.dumps({"pack": {
             "pack_format": PACK_FORMAT,
-            "description": f"Knight Online terrain textures for {self.title} (ko2mc)"}}, indent=2)
+            "description": f"Knight Online textures for {self.title} (ko2mc)"}}, indent=2)
         files["ko2mc_textures.txt"] = "\n".join(
-            f"t{i}\t{custom_state(i)[0]}\t{n}" for i, n in enumerate(self.names))
-        if self.images:
-            files["pack.png"] = self._png(self.images[0])
+            [f"t{i}\t{custom_state(i)[0]}\t{n}" for i, n in enumerate(self.names)]
+            + [f"o{i}\t{self._solid_slots[i][0]}" for i in range(len(self.solid))]
+            + [f"f{i}\t{self._foliage_slots[i][0]}" for i in range(len(self.foliage))]
+            + [f"p{i}\t{self._plant_slots[i][0]}" for i in range(len(self.plants))])
+        icon = self.images[0] if self.images else (self.solid[0] if self.solid else None)
+        if icon is not None:
+            files["pack.png"] = self._png(icon, brighten=bool(self.images))
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             for name, content in files.items():
                 zf.writestr(name, content)
-        print(f"  wrote resource pack {path} ({len(self.images)} KO textures)")
+        print(f"  wrote resource pack {path} ({len(self.images)} ground, {len(self.solid)} building, "
+              f"{len(self.foliage)} foliage, {len(self.plants)} plant, "
+              f"{len(self.stairs) + len(self.slabs)} step textures)")
 
 
 def tile_texture_key(gtd, tex_idx: int) -> tuple[str, int] | None:
