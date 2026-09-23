@@ -4,10 +4,10 @@ For every block a model covers we remember which KO texture it came from, where
 in that texture (the texel at the block's centre) and how many texels one block
 spans. That's enough to cut the matching piece out of the KO texture.
 
-A resource pack can only add a limited number of block looks (see
-custom_blocks.py), so similar-looking blocks are grouped (k-means on a small
-3 x 3 colour grid per block) and every group gets the real KO piece of its most
-typical block. Leaves get see-through leaf blocks with KO leaf textures, and
+Every KO texture is cut into block-sized pieces, so a wall shows its texture
+continuously like in KO. A resource pack can only add about a thousand block
+looks (see custom_blocks.py), so textures share those out and a texture with too
+few looks merges its most similar pieces (never pieces of different textures). Leaves get see-through leaf blocks with KO leaf textures, and
 grass/flower objects become crossed plant sprites instead of blocks.
 """
 
@@ -24,28 +24,38 @@ OBJECT_BRIGHTNESS = 1.15      # KO lights objects a little brighter than stored
 PIECE = 32                    # pixels per block texture
 
 
+FACINGS = ("north", "east", "south", "west")
+
+
+def _facing(dx, dz):
+    """Index into FACINGS of the horizontal direction (dx, dz) (Minecraft: north = -z)."""
+    return np.where(np.abs(dx) > np.abs(dz), np.where(dx > 0, 1, 3), np.where(dz > 0, 2, 0))
+
+
 def _texel_scale(tris_mc, uvs, tex_shape):
-    """Texels per block along the surface (median over the part's triangles)."""
+    """Texels per block across (u) and down (v) the texture, area-weighted median over the part."""
     h, w = tex_shape[:2]
-    duv = np.concatenate([uvs[:, 1] - uvs[:, 0], uvs[:, 2] - uvs[:, 0]])
-    dpos = np.concatenate([tris_mc[:, 1] - tris_mc[:, 0], tris_mc[:, 2] - tris_mc[:, 0]])
-    lp = np.linalg.norm(dpos, axis=1)
-    lt = np.linalg.norm(duv * np.array([w, h]), axis=1)
-    ok = lp > 0.05
+    e1 = tris_mc[:, 1] - tris_mc[:, 0]
+    e2 = tris_mc[:, 2] - tris_mc[:, 0]
+    d1 = uvs[:, 1] - uvs[:, 0]
+    d2 = uvs[:, 2] - uvs[:, 0]
+    # metric of the triangle's plane; |grad u|^2 = du^T G^-1 du
+    g11, g12, g22 = (e1 * e1).sum(1), (e1 * e2).sum(1), (e2 * e2).sum(1)
+    det = g11 * g22 - g12 * g12
+    ok = det > 1e-6
     if not ok.any():
-        return 16.0
-    return float(np.clip(np.median(lt[ok] / lp[ok]), 2.0, max(w, h)))
-
-
-def _sample_grid(tex, tx, ty, scale, n):
-    """n x n texel colours around (tx, ty), spanning `scale` texels (wrapping)."""
-    h, w = tex.shape[:2]
-    offs = ((np.arange(n) + 0.5) / n - 0.5)
-    ox = (tx[:, None, None] + offs[None, None, :] * scale[:, None, None])
-    oy = (ty[:, None, None] + offs[None, :, None] * scale[:, None, None])
-    ix = np.floor(ox).astype(np.int64) % w
-    iy = np.floor(oy).astype(np.int64) % h
-    return tex[iy, ix]                                     # (N, n, n, 4)
+        return 16.0, 16.0
+    out = []
+    for k, size in ((0, w), (1, h)):
+        a, b = d1[ok, k], d2[ok, k]
+        grad2 = (g22[ok] * a * a - 2 * g12[ok] * a * b + g11[ok] * b * b) / det[ok]
+        val = np.sqrt(np.maximum(grad2, 0)) * size
+        wt = np.sqrt(det[ok])
+        o = np.argsort(val)
+        c = np.cumsum(wt[o])
+        med = val[o][np.searchsorted(c, c[-1] / 2)]
+        out.append(float(np.clip(med, 2.0, max(w, h))))
+    return out[0], out[1]
 
 
 def _kmeans_fit_assign(feat, k, seed=0, fit_max=120_000):
@@ -78,8 +88,9 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
 
     size = cm.size_blocks
     textures, tex_index = [], {}
-    FULL, SLAB = 2, 1
-    cols = {n: [] for n in ("key", "prio", "tex", "tx", "ty", "scale", "dist", "leaf", "walk")}
+    STAIR, FULL, SLAB = 3, 2, 1
+    cols = {n: [] for n in ("key", "prio", "tex", "tx", "ty", "scale", "scale_y", "dist", "leaf", "walk",
+                            "face")}
     plants = []            # (texture id, uv box, height in blocks, positions (n, 3))
     built, missing = set(), 0
 
@@ -89,7 +100,7 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
             textures.append(rgba)
         return tex_index[name]
 
-    def add(keys, prio, tid, tx, ty, scale, dist, leaf, walk):
+    def add(keys, prio, tid, tx, ty, scale, dist, leaf, walk, face=-1):
         n = len(keys)
         if n == 0:
             return
@@ -98,10 +109,12 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
         cols["tex"].append(np.full(n, tid, np.int32))
         cols["tx"].append(np.asarray(tx, np.float32))
         cols["ty"].append(np.asarray(ty, np.float32))
-        cols["scale"].append(np.full(n, scale, np.float32))
+        cols["scale"].append(np.full(n, scale[0], np.float32))
+        cols["scale_y"].append(np.full(n, scale[1], np.float32))
         cols["dist"].append(np.asarray(dist, np.float32))
         cols["leaf"].append(np.full(n, leaf, bool))
         cols["walk"].append(np.full(n, walk, bool) if np.isscalar(walk) else walk)
+        cols["face"].append(np.full(n, face, np.int8) if np.isscalar(face) else face.astype(np.int8))
 
     for i, shape in enumerate(opd.shapes):
         name = shape.name.lower()
@@ -112,6 +125,8 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
             missing += 1
             continue
         parts = list(library.shape_parts(shape))
+        if kind == "bush" and not simple_plants and _small_plant(parts, cm):
+            kind = "grass"       # knee-high bushes: a plant sprite reads better than a lump of leaves
         if kind in PLANT_KINDS and not shape.is_event_object:
             if not simple_plants:
                 _collect_plant(shape, parts, cm, terrain, tex_id, plants)
@@ -137,6 +152,8 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
             nrm = -np.cross(mc[:, 1] - mc[:, 0], mc[:, 2] - mc[:, 0])
             if mirrored:
                 nrm = -nrm
+            if part.render_flags & km.RF_DOUBLESIDED:
+                nrm = np.where(nrm[:, 1:2] < 0, -nrm, nrm)     # one surface seen from both sides: face up
             ny = nrm[:, 1] / (np.linalg.norm(nrm, axis=1) + 1e-9)
             up = (ny > 0.7)[tri] & (not alpha)
             vx = np.floor(pts[:, 0]).astype(np.int64)
@@ -148,6 +165,9 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
 
             wall = inside & ~up
             wy = np.floor(pts[:, 1]).astype(np.int64)
+            # underside of a steep roof: same layer as the roof stairs above it
+            under = ((ny < -0.7) & (ny > -0.9))[tri]
+            wy = np.where(under, np.floor(pts[:, 1] - 0.5).astype(np.int64), wy)
             wall &= wy >= ground
             if wall.any():
                 d = np.linalg.norm(pts[wall] - (np.stack([vx[wall], wy[wall], vz[wall]], 1) + 0.5), axis=1)
@@ -164,9 +184,17 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
                 x_, z_, g = vx[top], vz[top], ground[top]
                 keep = ty_ > g
                 d = np.hypot(pts[top, 0] - x_ - 0.5, pts[top, 2] - z_ - 0.5)
-                for m, prio in ((keep & ~half, FULL), (keep & half, SLAB)):
+                # steep roofs (26-45 degrees): stairs climbing the slope; gentler slopes keep
+                # half/full steps
+                steep = (ny < 0.9)[tri[top]]
+                sy = np.floor(pts[top, 1] - 0.5).astype(np.int64)
+                ty_ = np.where(steep, sy, ty_)
+                keep = ty_ > g
+                uphill = _facing(-nrm[tri[top], 0], -nrm[tri[top], 2])
+                for m, prio, face in ((keep & ~half & ~steep, FULL, -1), (keep & half & ~steep, SLAB, -1),
+                                      (keep & steep, STAIR, uphill)):
                     add(_key(x_[m], ty_[m], z_[m]), prio, tid, txf[top][m], tyf[top][m], scale, d[m], False,
-                        prio == FULL)
+                        prio == FULL, face if np.isscalar(face) else face[m])
                 low = keep & (ty_ - g <= FILL_BELOW_STEPS)
                 if low.any():
                     idx = np.flatnonzero(low)
@@ -189,7 +217,7 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
         return n_plants, built
 
     c = {k: np.concatenate(v) for k, v in cols.items()}
-    # winner per block: full beats slab, then the sample closest to the block centre
+    # winner per block: roof stairs beat full blocks beat slabs, then the sample closest to the centre
     order = np.lexsort((c["dist"], -c["prio"], c["key"]))
     first = np.r_[True, c["key"][order][1:] != c["key"][order][:-1]]
     w = order[first]
@@ -198,55 +226,36 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
     # a block is walkable if any walkable top sample landed in it
     wk = np.unique(c["key"][c["walk"]])
     walk_any = np.isin(v["key"], wk) & (v["prio"] == FULL) & ~v["leaf"]
+    # a roof stair with a block right above it is inside the roof: make it a full block
+    sx, sy, sz = _unkey(v["key"])
+    covered = np.isin(_key(sx, sy + 1, sz), v["key"])
+    v["prio"][(v["prio"] == STAIR) & covered] = FULL
 
-    # appearance: 3x3 colour grid of the KO texture piece each block shows
-    feat = np.zeros((len(w), 3, 3, 4), np.uint8)
-    for t in np.unique(v["tex"]):
-        m = v["tex"] == t
-        feat[m] = _sample_grid(textures[t], v["tx"][m], v["ty"][m], v["scale"][m], 3)
     leaf = v["leaf"]
     ids = np.zeros(len(w), np.int64)
-
-    def piece(j):
-        img = _sample_grid(textures[v["tex"][j]], v["tx"][j:j + 1], v["ty"][j:j + 1],
-                           v["scale"][j:j + 1], PIECE)[0].astype(np.float32)
-        img[..., :3] = np.clip(img[..., :3] * OBJECT_BRIGHTNESS, 0, 255)
-        return img.astype(np.uint8)
-
-    def representative(members, labels, centres, f):
-        reps = {}
-        for g in np.unique(labels):
-            mm = members[labels == g]
-            d = ((f[labels == g] - centres[g]) ** 2).sum(1)
-            reps[int(g)] = int(mm[d.argmin()])
-        return reps
 
     # solid blocks
     solid = np.flatnonzero(~leaf)
     if len(solid):
-        f = feat[solid, :, :, :3].reshape(len(solid), -1).astype(np.float32)
-        labels, centres = _kmeans_fit_assign(f.astype(np.uint8), pack.max_solid, seed)
-        reps = representative(solid, labels, centres, f)
-        state_of = {}
-        for g, j in reps.items():
-            img = piece(j)
-            img[..., 3] = 255
+        look, imgs, feats = _texture_looks(v, solid, textures, pack.max_solid, seed, alpha=False)
+        state_of = []
+        for img in imgs:
             st = pack.add_solid(img)
-            state_of[g] = world.block_id(st) if st else world.block_id("minecraft:stone")
-        ids[solid] = [state_of[int(g)] for g in labels]
+            state_of.append(world.block_id(st) if st else world.block_id("minecraft:stone"))
+        ids[solid] = np.array(state_of)[look]
         # slabs and stairs: the most used step looks get their own stairs/slab type
-        _steps(v, solid, labels, centres, reps, walk_any, ids, piece, terrain, world, pack, cm)
+        group = np.full(len(w), -1, np.int64)
+        group[solid] = look
+        _steps(v, group, feats, imgs, walk_any, ids, terrain, world, pack, cm)
     # leaves
     lv = np.flatnonzero(leaf)
     if len(lv):
-        f = feat[lv].reshape(len(lv), -1).astype(np.float32)
-        labels, centres = _kmeans_fit_assign(f.astype(np.uint8), pack.max_foliage, seed)
-        reps = representative(lv, labels, centres, f)
-        state_of = {}
-        for g, j in reps.items():
-            st = pack.add_foliage(piece(j))
-            state_of[g] = world.block_id(st) if st else world.block_id("minecraft:oak_leaves[persistent=true]")
-        ids[lv] = [state_of[int(g)] for g in labels]
+        look, imgs, _ = _texture_looks(v, lv, textures, pack.max_foliage, seed, alpha=True)
+        state_of = []
+        for img in imgs:
+            st = pack.add_foliage(img)
+            state_of.append(world.block_id(st) if st else world.block_id("minecraft:oak_leaves[persistent=true]"))
+        ids[lv] = np.array(state_of)[look]
 
     x, y, z = _unkey(v["key"])
     world.set_blocks(x, y, z, ids.astype(np.uint16))
@@ -257,16 +266,16 @@ def build_objects(opd, terrain, world, cm, library, pack, simple_plants=False, s
     return len(w) + n_plants, built
 
 
-def _steps(v, solid, labels, centres, reps, walk_any, ids, piece, terrain, world, pack, cm):
-    """Slabs keep their half height; one-block rises on walkable surfaces become stairs."""
+def _steps(v, group, feats, imgs, walk_any, ids, terrain, world, pack, cm):
+    """Slabs keep their half height; one-block rises on walkable surfaces become stairs.
+
+    group = look index of every block (-1 = none), feats/imgs = per look."""
     from . import custom_blocks as cb
     from .converter import _add_stairs_facing
     types = cb.STAIR_SLAB_TYPES
-    group = np.full(len(v["key"]), -1, np.int64)
-    group[solid] = labels
     is_slab = v["prio"] == 1
 
-    facing = _add_stairs_facing(v["key"], walk_any, ~v["leaf"] & ~is_slab, terrain, cm)
+    facing = _add_stairs_facing(v["key"], walk_any, ~v["leaf"] & ~is_slab & (v["prio"] != 3), terrain, cm)
 
     def assign(mask, setter, state_fmt):
         idx = np.flatnonzero(mask)
@@ -276,13 +285,11 @@ def _steps(v, solid, labels, centres, reps, walk_any, ids, piece, terrain, world
         used, counts = np.unique(g, return_counts=True)
         chosen = used[np.argsort(-counts)][:len(types)]
         # every step look maps to the nearest chosen look
-        d = ((centres[used][:, None] - centres[chosen][None]) ** 2).sum(-1)
+        d = ((feats[used][:, None] - feats[chosen][None]) ** 2).sum(-1)
         nearest = dict(zip(used.tolist(), chosen[d.argmin(1)].tolist()))
         type_of = {}
         for t, gg in zip(types, chosen):
-            img = piece(reps[int(gg)])
-            img[..., 3] = 255
-            setter(t, img)
+            setter(t, imgs[int(gg)])
             type_of[int(gg)] = t
         for j, gg in zip(idx, g):
             t = type_of[nearest[int(gg)]]
@@ -290,6 +297,9 @@ def _steps(v, solid, labels, centres, reps, walk_any, ids, piece, terrain, world
 
     assign(is_slab & (group >= 0), pack.set_slab,
            lambda t, j: f"minecraft:{t}_slab[type=bottom,waterlogged=false]")
+    roof = (v["prio"] == 3) & (v["face"] >= 0)
+    for j in np.flatnonzero(roof):
+        facing[int(v["key"][j])] = FACINGS[int(v["face"][j])]
     stairs = np.array([k in facing for k in v["key"].tolist()]) & (group >= 0)
     assign(stairs, pack.set_stairs,
            lambda t, j: f"minecraft:{t}_stairs[facing={facing[int(v['key'][j])]},half=bottom,"
@@ -299,8 +309,137 @@ def _steps(v, solid, labels, centres, reps, walk_any, ids, piece, terrain, world
 
 
 # ---------------------------------------------------------------------------
+# block looks
+# ---------------------------------------------------------------------------
+
+MAX_CELLS = 32         # a texture is cut into at most 32 x 32 block-sized pieces
+
+
+def _pow2_cells(size, scale):
+    """How many block-sized pieces fit across a texture side (power of two, 1..MAX_CELLS)."""
+    n = np.maximum(size / np.maximum(scale, 1e-3), 1.0)
+    return np.clip(2 ** np.round(np.log2(n)), 1, MAX_CELLS).astype(np.int64)
+
+
+def _cell_image(tex, gx, gy, cx, cy, alpha):
+    """One block look: piece (cx, cy) of a texture cut into gx x gy pieces, PIECE px square."""
+    h, w = tex.shape[:2]
+    x0, x1 = cx * w // gx, (cx + 1) * w // gx
+    y0, y1 = cy * h // gy, (cy + 1) * h // gy
+    crop = tex[y0:max(y1, y0 + 1), x0:max(x1, x0 + 1)]
+    ch, cw = crop.shape[:2]
+    # area-average (or repeat) to PIECE x PIECE
+    ys = (np.arange(PIECE + 1) * ch / PIECE).astype(np.int64)
+    xs = (np.arange(PIECE + 1) * cw / PIECE).astype(np.int64)
+    if ch >= PIECE and cw >= PIECE:
+        c = np.cumsum(np.cumsum(np.pad(crop.astype(np.float64), ((1, 0), (1, 0), (0, 0))), 0), 1)
+        tot = c[ys[1:, None], xs[None, 1:]] - c[ys[:-1, None], xs[None, 1:]] \
+            - c[ys[1:, None], xs[None, :-1]] + c[ys[:-1, None], xs[None, :-1]]
+        img = tot / ((ys[1:] - ys[:-1])[:, None, None] * (xs[1:] - xs[:-1])[None, :, None])
+    else:
+        img = crop[np.minimum(ys[:-1], ch - 1)[:, None], np.minimum(xs[:-1], cw - 1)[None, :]].astype(np.float64)
+    img[..., :3] = np.clip(img[..., :3] * OBJECT_BRIGHTNESS, 0, 255)
+    img = img.astype(np.uint8)
+    if alpha:
+        img[..., 3] = np.where(img[..., 3] >= 128, 255, 0)
+    else:
+        img[..., 3] = 255
+    return img
+
+
+def _texture_looks(v, members, textures, budget, seed, alpha):
+    """Block looks for the blocks `members`.
+
+    Every KO texture is cut into block-sized pieces (as big as one block on the
+    model), and a block shows the piece its centre lies on, so neighbouring
+    blocks continue the texture the way KO draws it. The pack only has `budget`
+    looks, so textures share them out (more for textures on many blocks); a
+    texture with fewer looks than pieces merges its similar pieces. Looks are
+    never shared between textures, so every wall keeps its own material.
+
+    Returns (look index per member, look images, look features)."""
+    from .converter import _small
+    from .ko_ground import _kmeans
+    tex = v["tex"][members]
+    scale, scale_y = v["scale"][members], v["scale_y"][members]
+    units, unit_of = {}, np.empty(len(members), np.int64)
+    for t in np.unique(tex):
+        m = np.flatnonzero(tex == t)
+        h, w = textures[t].shape[:2]
+        gx = _pow2_cells(w, scale[m])
+        gy = _pow2_cells(h, scale_y[m])
+        cx = (np.mod(v["tx"][members[m]], w) * gx // w).astype(np.int64)
+        cy = (np.mod(v["ty"][members[m]], h) * gy // h).astype(np.int64)
+        key = ((gx * 64 + gy) * 64 + cx) * 64 + cy
+        uk, inv = np.unique(key, return_inverse=True)
+        for k in uk.tolist():
+            units[(int(t), k)] = len(units)
+        unit_of[m] = np.array([units[(int(t), k)] for k in uk.tolist()])[inv.ravel()]
+    keys = list(units)
+    count = np.bincount(unit_of, minlength=len(keys)).astype(np.float64)
+    utex = np.array([t for t, _ in keys])
+    imgs = []
+    for t, k in keys:
+        cy = k % 64; cx = (k // 64) % 64; gy = (k // 4096) % 64; gx = k // 262144
+        imgs.append(_cell_image(textures[t], gx, gy, cx, cy, alpha))
+    feat = np.stack([np.concatenate([_small(im), [im[..., 3].mean() / 4]]) for im in imgs])
+
+    # share the budget: water-filling on sqrt(blocks) per texture, at least one look each
+    tids = np.unique(utex)
+    need = np.array([(utex == t).sum() for t in tids])
+    weight = np.sqrt(np.array([count[utex == t].sum() for t in tids]))
+    if need.sum() <= budget:
+        alloc = need
+    else:
+        lo, hi = 0.0, float(budget)
+        for _ in range(60):
+            lam = (lo + hi) / 2
+            alloc = np.minimum(need, np.maximum(1, np.floor(lam * weight / weight.sum()))).astype(np.int64)
+            lo, hi = (lam, hi) if alloc.sum() <= budget else (lo, lam)
+        alloc = np.minimum(need, np.maximum(1, np.floor(lo * weight / weight.sum()))).astype(np.int64)
+        if alloc.sum() > budget:          # more textures than looks: the least used share one each
+            order = np.argsort(-weight)
+            alloc = np.zeros_like(need)
+            alloc[order[:budget]] = 1
+    look_of_unit = np.full(len(keys), -1, np.int64)
+    out_imgs, out_feat = [], []
+    for t, k in zip(tids, alloc):
+        u = np.flatnonzero(utex == t)
+        if k <= 0:
+            continue
+        if len(u) <= k:
+            lab = np.arange(len(u))
+        else:
+            lab = _kmeans(feat[u], count[u], int(k), seed)
+        for g in np.unique(lab):
+            mm = u[lab == g]
+            centre = np.average(feat[mm], axis=0, weights=count[mm])
+            rep = mm[((feat[mm] - centre) ** 2).sum(1).argmin()]
+            look_of_unit[mm] = len(out_imgs)
+            out_imgs.append(imgs[rep])
+            out_feat.append(feat[rep])
+    out_feat = np.stack(out_feat)
+    # textures without a look of their own take the nearest look
+    left = np.flatnonzero(look_of_unit < 0)
+    if len(left):
+        d = ((feat[left][:, None] - out_feat[None]) ** 2).sum(-1)
+        look_of_unit[left] = d.argmin(1)
+    print(f"    {len(tids)} KO textures, {len(keys)} block-sized pieces -> {len(out_imgs)} "
+          f"{'foliage' if alpha else 'building'} looks")
+    return look_of_unit[unit_of], out_imgs, out_feat
+
+
+# ---------------------------------------------------------------------------
 # plants
 # ---------------------------------------------------------------------------
+
+def _small_plant(parts, cm, max_height=2.0):
+    ys = [tris[..., 1].ravel() for tris, _, _, _ in parts]
+    if not ys:
+        return False
+    y = np.concatenate(ys)
+    return (cm.y(y.max()) - cm.y(y.min())) <= max_height
+
 
 def _collect_plant(shape, parts, cm, terrain, tex_id, plants):
     pts, best = [], None

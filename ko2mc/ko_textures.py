@@ -18,8 +18,9 @@ standard custom-block trick: note block states. A note block has 16
 instruments x 25 notes, and a resource pack can give each state its own model
 and texture. Minecraft recalculates a note block's instrument from the block
 under it, so the converter puts the matching "instrument block" directly
-underneath (e.g. stone for basedrum); that keeps the texture stable when
-players build next to it. Right-clicking a note block still changes its note
+underneath (e.g. netherrack for basedrum); that keeps the texture stable when
+players build next to it. Ground textures are grouped by look per instrument,
+and the instrument block gets its group's look, so terrace edges match. Right-clicking a note block still changes its note
 (and therefore its texture), so this is best for exploring, not survival play.
 """
 
@@ -34,35 +35,40 @@ import numpy as np
 PACK_FORMAT = 22          # Minecraft 1.20.3 / 1.20.4
 NAMESPACE = "ko2mc"
 
-# instrument -> a block that produces it when placed under a note block
+# instrument -> a block that produces it when placed under a note block. These
+# blocks show on terrace edges, so the pack gives them a KO ground look too
+# (see TexturePack.set_under); they're picked so a converted world uses them
+# nowhere else. (pling needs glowstone, which would light up the ground, so it's left out.)
 INSTRUMENT_BLOCKS = [
-    ("harp", "minecraft:dirt"),
-    ("basedrum", "minecraft:stone"),
-    ("snare", "minecraft:sand"),        # safe: it always sits on solid ground
+    ("harp", "minecraft:rooted_dirt"),
+    ("basedrum", "minecraft:netherrack"),
+    ("snare", "minecraft:light_gray_concrete_powder"),   # safe: always sits on solid ground
     ("hat", "minecraft:glass"),
-    ("bass", "minecraft:oak_planks"),
+    ("bass", "minecraft:bookshelf"),
     ("flute", "minecraft:clay"),
     ("bell", "minecraft:gold_block"),
     ("guitar", "minecraft:white_wool"),
     ("chime", "minecraft:packed_ice"),
-    ("xylophone", "minecraft:bone_block"),
+    ("xylophone", "minecraft:bone_block[axis=y]"),
     ("iron_xylophone", "minecraft:iron_block"),
     ("cow_bell", "minecraft:soul_sand"),
     ("didgeridoo", "minecraft:pumpkin"),
     ("bit", "minecraft:emerald_block"),
-    ("banjo", "minecraft:hay_block"),
-    ("pling", "minecraft:glowstone"),
+    ("banjo", "minecraft:hay_block[axis=y]"),
 ]
 NOTES = 25
+SLOTS_PER_INSTRUMENT = NOTES * 2                   # powered=false/true
 ALL_INSTRUMENTS = [i for i, _ in INSTRUMENT_BLOCKS] + [
-    "zombie", "skeleton", "creeper", "dragon", "wither_skeleton", "piglin", "custom_head"]
-MAX_CUSTOM = len(INSTRUMENT_BLOCKS) * NOTES * 2   # powered=false/true
+    "pling", "zombie", "skeleton", "creeper", "dragon", "wither_skeleton", "piglin", "custom_head"]
+MAX_CUSTOM = len(INSTRUMENT_BLOCKS) * SLOTS_PER_INSTRUMENT
 
 
 def custom_state(i: int) -> tuple[str, str]:
-    """Note block state + the block that must sit under it, for custom texture #i."""
-    powered, rest = divmod(i, len(INSTRUMENT_BLOCKS) * NOTES)
-    inst, note = divmod(rest, NOTES)
+    """Note block state + the block that must sit under it, for custom texture #i.
+
+    Slots are grouped by instrument: 0-49 harp, 50-99 basedrum, ..."""
+    inst, j = divmod(i, SLOTS_PER_INSTRUMENT)
+    powered, note = divmod(j, NOTES)
     name, below = INSTRUMENT_BLOCKS[inst]
     state = f"minecraft:note_block[instrument={name},note={note},powered={'true' if powered else 'false'}]"
     return state, below
@@ -194,8 +200,9 @@ class TexturePack:
         # The KO client lights terrain with "modulate 2x" (then darkens it with its
         # colour map), so stored textures are darker than they look in game.
         self.brightness = brightness
-        self.images: list[np.ndarray] = []        # ground
-        self.names: list[str] = []
+        self.images: dict[int, np.ndarray] = {}   # ground: note block slot -> image
+        self.names: dict[int, str] = {}
+        self.under: dict[str, np.ndarray] = {}    # instrument block state -> image
         from . import custom_blocks as cb
         self._solid_slots = cb.solid_slots()
         self._foliage_slots = cb.foliage_slots()
@@ -211,12 +218,19 @@ class TexturePack:
         return not (self.images or self.solid or self.foliage or self.plants)
 
     # ---- ground ----
-    def add(self, rgba: np.ndarray, label: str) -> int | None:
-        if len(self.images) >= MAX_CUSTOM:
+    def add(self, rgba: np.ndarray, label: str, slot: int | None = None) -> int | None:
+        """Ground texture; slot picks the note block state (see custom_state), default next free."""
+        if slot is None:
+            slot = next((i for i in range(MAX_CUSTOM) if i not in self.images), None)
+        if slot is None or not 0 <= slot < MAX_CUSTOM:
             return None
-        self.images.append(rgba)
-        self.names.append(label)
-        return len(self.images) - 1
+        self.images[slot] = rgba
+        self.names[slot] = label
+        return slot
+
+    def set_under(self, block_state: str, rgba: np.ndarray):
+        """Ground look for an instrument block (shows on terrace edges)."""
+        self.under[block_state] = rgba
 
     # ---- objects ----
     @property
@@ -255,7 +269,7 @@ class TexturePack:
     def set_slab(self, block_type: str, rgba: np.ndarray):
         self.slabs[block_type] = rgba
 
-    def average_color(self, i: int) -> tuple[int, int, int]:
+    def average_color(self, i: int) -> tuple[int, int, int]:  # i = ground slot
         return tuple(int(c) for c in self.images[i][..., :3].reshape(-1, 3).mean(0))
 
     def _png(self, rgba: np.ndarray, brighten: bool = True, alpha: bool = False) -> bytes:
@@ -286,11 +300,20 @@ class TexturePack:
             return f"{ns}:block/{name}"
 
         # ground: note block states with the instrument block underneath
-        for i, img in enumerate(self.images):
+        for i, img in sorted(self.images.items()):
             state, _ = custom_state(i)
             props = state[state.index("[") + 1:-1]
             states.setdefault("note_block", {})[props] = {"model": cube(f"t{i}", f"t{i}")}
             files[f"assets/{ns}/textures/block/t{i}.png"] = self._png(img)
+        # instrument blocks under the ground: their group's look on every face
+        under_hosts = set()
+        for st, img in self.under.items():
+            b = st.split(":")[1].split("[")[0]
+            under_hosts.add(b)
+            m = cube(f"u_{b}", f"u_{b}")
+            files[f"assets/{ns}/textures/block/u_{b}.png"] = self._png(img)
+            for k in (cb.all_block_states(b) if b in cb.UNDER_STATES else [""]):
+                states.setdefault(b, {})[k] = {"model": m}
         # solid object blocks
         for i, img in enumerate(self.solid):
             _, host, keys = self._solid_slots[i]
@@ -344,6 +367,8 @@ class TexturePack:
                         for powered in ("false", "true"):
                             variants.setdefault(f"instrument={inst},note={note},powered={powered}",
                                                 {"model": "minecraft:block/note_block"})
+            elif host in under_hosts:
+                pass                                   # every state already listed
             else:
                 fallback = next(iter(variants.values()))
                 for k in cb.all_block_states(host):
@@ -354,11 +379,12 @@ class TexturePack:
             "pack_format": PACK_FORMAT,
             "description": f"Knight Online textures for {self.title} (ko2mc)"}}, indent=2)
         files["ko2mc_textures.txt"] = "\n".join(
-            [f"t{i}\t{custom_state(i)[0]}\t{n}" for i, n in enumerate(self.names)]
+            [f"t{i}\t{custom_state(i)[0]}\t{n}" for i, n in sorted(self.names.items())]
+            + [f"u\t{b}" for b in self.under]
             + [f"o{i}\t{self._solid_slots[i][0]}" for i in range(len(self.solid))]
             + [f"f{i}\t{self._foliage_slots[i][0]}" for i in range(len(self.foliage))]
             + [f"p{i}\t{self._plant_slots[i][0]}" for i in range(len(self.plants))])
-        icon = self.images[0] if self.images else (self.solid[0] if self.solid else None)
+        icon = next(iter(self.images.values())) if self.images else (self.solid[0] if self.solid else None)
         if icon is not None:
             files["pack.png"] = self._png(icon, brighten=bool(self.images))
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)

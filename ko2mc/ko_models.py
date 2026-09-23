@@ -150,7 +150,7 @@ BUILD_BLOCKS = [
     "cyan_terracotta", "green_terracotta", "black_terracotta", "light_blue_terracotta",
     "oak_planks", "spruce_planks", "birch_planks", "jungle_planks", "acacia_planks",
     "dark_oak_planks", "mangrove_planks", "oak_log", "spruce_log", "dark_oak_log", "birch_log",
-    "gold_block", "iron_block", "snow_block", "clay", "hay_block", "bone_block", "obsidian",
+    "snow_block", "obsidian",
     "weathered_copper", "oxidized_copper", "warped_planks", "crimson_planks",
 ]
 # Half-height version of a block, used to make even, walkable steps.

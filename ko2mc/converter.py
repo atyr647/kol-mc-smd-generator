@@ -109,6 +109,45 @@ class CoordMap:
         return CoordMap(scale, gtd.size_meters, v, float(offset))
 
 
+def _instrument_slots(reps, counts, seed=0):
+    """Note block slot for every ground texture: similar textures share an instrument
+    (and so the look of the instrument block under them), 50 slots per instrument."""
+    from .ko_ground import _kmeans
+    from .ko_textures import INSTRUMENT_BLOCKS, SLOTS_PER_INSTRUMENT
+    n_inst = len(INSTRUMENT_BLOCKS)
+    have = [g for g, r in enumerate(reps) if r is not None]
+    slots = np.full(len(reps), -1, np.int64)
+    if not have:
+        return slots
+    feat = np.stack([_small(reps[g]) for g in have])
+    w = np.maximum(counts[have].astype(np.float64), 1)
+    labels = _kmeans(feat, w, min(n_inst, len(have)), seed)
+    centres = np.stack([feat[labels == c].mean(0) if (labels == c).any() else feat[0]
+                        for c in range(n_inst)])
+    # nearest instrument group with room left, most used textures first
+    d = ((feat[:, None] - centres[None]) ** 2).sum(-1)
+    free = [SLOTS_PER_INSTRUMENT] * n_inst
+    for i in np.argsort(-w):
+        for c in np.argsort(d[i]):
+            if free[c]:
+                slots[have[i]] = c * SLOTS_PER_INSTRUMENT + SLOTS_PER_INSTRUMENT - free[c]
+                free[c] -= 1
+                break
+    return slots
+
+
+def _small(img, n=4):
+    """n x n average colours of an image, flattened (a cheap look descriptor)."""
+    h, w = img.shape[:2]
+    a = img[: h // n * n, : w // n * n, :3].astype(np.float32)
+    return a.reshape(n, h // n, n, w // n, 3).mean((1, 3)).ravel()
+
+
+def _medoid(imgs, members):
+    f = np.stack([_small(imgs[g]) for g in members])
+    return members[int(((f - f.mean(0)) ** 2).sum(1).argmin())]
+
+
 def _bilinear(grid: np.ndarray, fx: np.ndarray, fz: np.ndarray) -> np.ndarray:
     """Sample grid[x, z] at fractional indices (broadcast arrays)."""
     n = grid.shape[0]
@@ -137,6 +176,10 @@ class TerrainModel:
         heights = _bilinear(gtd.heights, FX, FZ)
         self.top = np.floor(cm.y(heights)).astype(np.int32)   # top solid block y
         self.top = np.clip(self.top, MIN_Y + 1, MAX_Y - 1)
+        # how many blocks of each column's side are open to the air (terrace edges)
+        t = np.pad(self.top, 1, mode="edge")
+        lowest = np.minimum.reduce([t[:-2, 1:-1], t[2:, 1:-1], t[1:-1, :-2], t[1:-1, 2:]])
+        self.exposed = np.clip(self.top - lowest, 1, 16).astype(np.int32)
 
         names, mat_grid = materials.material_grid(gtd)
         n = gtd.heightmap_size
@@ -182,8 +225,10 @@ class TerrainModel:
             print("  KO textures: none of this map's ground textures were found")
             return
         ids, below = [], []
+        slots = _instrument_slots(reps, np.bincount(group[group >= 0].ravel(), minlength=len(reps)))
+        unders = {}
         for g, img in enumerate(reps):
-            slot = pack.add(img, f"ground piece {g}") if img is not None else None
+            slot = pack.add(img, f"ground piece {g}", slots[g]) if img is not None and slots[g] >= 0 else None
             if slot is None:
                 ids.append(0)
                 below.append(0)
@@ -191,6 +236,10 @@ class TerrainModel:
             state, under = custom_state(slot)
             ids.append(world.block_id(state))
             below.append(world.block_id(under))
+            unders.setdefault(under, []).append(g)
+        # instrument blocks show on terrace edges: give each the look of its group
+        for under, gs in unders.items():
+            pack.set_under(under, reps[_medoid(reps, gs)])
         ids = np.array(ids + [0], np.uint16)          # index -1 -> 0 (no KO texture)
         below = np.array(below + [0], np.uint16)
         size = self.cm.size_blocks
@@ -248,14 +297,13 @@ class TerrainModel:
         ys = (np.arange(out.shape[0]) + MIN_Y)[:, None, None]
         view = out[:, za - z0:zb - z0, xa - x0:xb - x0]
         surface = np.where(wet, self.wet_surface_ids[mat], self.surface_ids[mat])
+        view[:] = np.where(ys < top - 3, self.deep_ids[mat], np.where(ys < top, self.sub_ids[mat], surface))
         if self.col_custom is not None:
             custom = self.col_custom[za:zb, xa:xb]
-            surface = np.where(custom > 0, custom, surface)
-            sub = np.where(ys == top - 1, np.where(custom > 0, self.col_below[za:zb, xa:xb],
-                                                   self.sub_ids[mat]), self.sub_ids[mat])
-        else:
-            sub = self.sub_ids[mat]
-        view[:] = np.where(ys < top - 3, self.deep_ids[mat], np.where(ys < top, sub, surface))
+            view[:] = np.where((ys == top) & (custom > 0), custom, view)
+            # the instrument block under a KO ground block (also down the open side of a terrace)
+            side = (ys < top) & (ys >= top - self.exposed[za:zb, xa:xb]) & (custom > 0)
+            view[:] = np.where(side, self.col_below[za:zb, xa:xb], view)
         view[ys > top] = 0
         water = (ys > top) & (ys <= wtop)
         view[water] = self.water
@@ -300,7 +348,7 @@ COLLISION_RULES = [
     (r"tree|_tr_|dumbul|bush|reed|grass|gass|plant|flower", None),  # vegetation handled as objects
     (r"ston|rock|mountain|cliff|mineral|sandhil|rockwal", ("minecraft:stone", "minecraft:stone")),
     (r"wood|bridge|board|fence|box|ship|cart|wagun|bench|table|tent", ("minecraft:oak_planks", "minecraft:spruce_planks")),
-    (r"snw|ice", ("minecraft:packed_ice", "minecraft:snow_block")),
+    (r"snw|ice", ("minecraft:blue_ice", "minecraft:snow_block")),
     (r"sand", ("minecraft:sandstone", "minecraft:smooth_sandstone")),
     (r"zip|house|haus|home|shop|bill|warehouse|room", ("minecraft:stone_bricks", "minecraft:spruce_planks")),
     (r"wal|castl|catl|gate|tower|tow_|fort|pillar|post", ("minecraft:stone_bricks", "minecraft:polished_andesite")),
@@ -457,17 +505,17 @@ class ObjectPlacer:
         elif t == OBJECT_BARRICADE:
             w.fill_box(x - 2, y, z, x + 2, y + 1, z, "minecraft:oak_fence")
         elif t in (OBJECT_BIND, OBJECT_REMOVE_BIND):
-            w.fill_box(x - 1, y - 1, z - 1, x + 1, y - 1, z + 1, "minecraft:gold_block")
+            w.fill_box(x - 1, y - 1, z - 1, x + 1, y - 1, z + 1, "minecraft:shroomlight")
             w.set_block(x, y, z, "minecraft:respawn_anchor[charges=4]")
         elif t == OBJECT_ANVIL:
             w.set_block(x, y, z, "minecraft:anvil[facing=north]")
         elif t == OBJECT_ARTIFACT:
-            w.fill_box(x - 1, y - 1, z - 1, x + 1, y - 1, z + 1, "minecraft:iron_block")
+            w.fill_box(x - 1, y - 1, z - 1, x + 1, y - 1, z + 1, "minecraft:polished_andesite")
             w.set_block(x, y, z, "minecraft:beacon")
         elif t in (OBJECT_GATE_LEVER, OBJECT_FLAG_LEVER):
             w.set_block(x, y, z, "minecraft:lever[face=floor,facing=north,powered=false]")
         else:
-            w.set_block(x, y, z, "minecraft:glowstone")
+            w.set_block(x, y, z, "minecraft:shroomlight")
         self.counts["event"] = self.counts.get("event", 0) + 1
 
 

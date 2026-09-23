@@ -36,6 +36,7 @@ import org.bukkit.event.block.NotePlayEvent;
 import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityInteractEvent;
+import org.bukkit.event.entity.ProjectileHitEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -57,7 +58,13 @@ public final class KOBlocksPlugin extends JavaPlugin implements Listener {
     private final Set<Material> hosts = EnumSet.noneOf(Material.class);
     private final Map<Location, BlockData> saved = new HashMap<>();
     private boolean restoreScheduled;
-    private boolean enabled, noteBlocks, tripwire, leafDecay;
+    private boolean enabled, noteBlocks, tripwire, leafDecay, containers;
+
+    /** KO blocks whose look would change when used (opened, filled, lit...). */
+    private static final Set<Material> STATEFUL_USE = EnumSet.of(
+            Material.BARREL, Material.CHISELED_BOOKSHELF, Material.JUKEBOX, Material.FURNACE,
+            Material.SMOKER, Material.BLAST_FURNACE, Material.DISPENSER, Material.DROPPER,
+            Material.BEEHIVE, Material.BEE_NEST);
 
     @Override
     public void onEnable() {
@@ -74,6 +81,7 @@ public final class KOBlocksPlugin extends JavaPlugin implements Listener {
         noteBlocks = getConfig().getBoolean("protect-note-blocks", true);
         tripwire = getConfig().getBoolean("protect-tripwire", true);
         leafDecay = getConfig().getBoolean("no-leaf-decay", true);
+        containers = getConfig().getBoolean("protect-containers", true);
         getServer().getPluginManager().registerEvents(this, this);
         getLogger().info("Protecting " + hosts.size() + " KO-textured block types");
     }
@@ -199,6 +207,16 @@ public final class KOBlocksPlugin extends JavaPlugin implements Listener {
         if (tripwire && e.getAction() == Action.PHYSICAL && b.getType() == Material.TRIPWIRE) {
             e.setCancelled(true);
         }
+        if (containers && e.getAction() == Action.RIGHT_CLICK_BLOCK && isHost(b)
+                && STATEFUL_USE.contains(b.getType())) {
+            e.setUseInteractedBlock(Event.Result.DENY);
+        }
+    }
+
+    /** Arrows hitting a target block set its power level (= another texture). */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onProjectileHit(ProjectileHitEvent e) {
+        if (e.getHitBlock() != null) protectSelf(e.getHitBlock());
     }
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)

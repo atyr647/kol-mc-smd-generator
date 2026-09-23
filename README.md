@@ -67,14 +67,15 @@ The converter prints where warp gates and bind points ended up, and how KO coord
 
 Every object in an `.opd` lists its model parts. With `--ko-models` pointing at the KO client's `Object` folder, each object is rebuilt from those models: parts are placed with the object's position, rotation and scale, and the model surface is filled with blocks.
 
-**Every block shows the real KO texture.** For each block the converter remembers which KO texture it came from and which piece of that texture it covers. Those pieces become block textures in the resource pack:
+**Every block shows the real KO texture.** Each KO texture is cut into block-sized pieces (as big as one block is on the model), and every block shows the piece it covers, so a wall continues its texture from block to block the way KO draws it, with stone courses and trim bands lining up:
 
-- **Walls, roofs, floors:** about 650 building looks. Similar pieces are grouped and each group uses the real KO piece closest to its average, so a wall shows KO's stone, tiles, wood beams and windows.
-- **Leaves and see-through parts** (tree leaves, bushes, railings, grates): leaf blocks with KO textures, so they stay see-through.
-- **Grass, flowers and reeds:** crossed plant sprites with the real KO plant texture, like Minecraft's grass (up to 2 blocks tall). Big grass patches become scattered tufts.
+- **Walls, roofs, floors:** about 1000 building looks. Textures on many blocks get more looks; a texture with fewer looks than pieces merges its most similar pieces. Looks are never shared between different textures, so every wall keeps its own material.
+- **Roofs:** steep roof slopes are built from stairs climbing the slope; gentle slopes and floors use half-block steps.
+- **Leaves and see-through parts** (tree leaves, railings, grates): leaf blocks with KO textures, so they stay see-through.
+- **Grass, flowers, reeds and small bushes:** crossed plant sprites with the real KO plant texture, like Minecraft's grass (up to 2 blocks tall). Big grass patches become scattered tufts.
 - **Steps:** floors, platforms and stair treads snap to half-block heights (slabs), low ones are filled solid down to the ground, and one-block rises become stairs, all with KO textures.
 
-Minecraft can't be sent brand-new blocks, so, like the ItemsAdder/Oraxen plugins, the pack gives existing block states new looks: unused note block, mushroom block, glazed terracotta, wool, ore and stone variants, leaves, tripwire, and the stairs/slab types. Those blocks look different everywhere in that world (for example, wool you place yourself shows a KO texture). See `ko2mc/custom_blocks.py` for the full list.
+Minecraft can't be sent brand-new blocks, so, like the ItemsAdder/Oraxen plugins, the pack gives existing block states new looks: unused note block, mushroom block, glazed terracotta, wool, ore and stone variants, chiseled bookshelf, barrel, beehive, furnace and dispenser states, leaves, tripwire, and the stairs/slab types. Those blocks look different everywhere in that world (for example, wool you place yourself shows a KO texture). See `ko2mc/custom_blocks.py` for the full list.
 
 Add `--vanilla-blocks` to build objects from normal Minecraft blocks picked by colour instead, and `--simple-plants` for normal Minecraft grass and flowers. Effect objects (glows, smoke, sparkles) are skipped because they aren't solid.
 
@@ -98,7 +99,8 @@ Copy the jar into your Paper server's `plugins` folder and use the converted wor
 
 - puts back any KO block whose state changes because of something nearby (placing, breaking, explosions, pistons, water, redstone...);
 - stops right-clicks from re-tuning note blocks, and walking through plant sprites from triggering them;
-- stops leaves from decaying.
+- stops leaves from decaying;
+- stops KO-textured barrels, furnaces, bookshelves, beehives and the like from being opened or filled (that would change their look).
 
 Breaking and placing blocks still works normally. `plugins/KO2MC-Blocks/config.yml` lists the protected blocks and has on/off switches.
 
@@ -121,8 +123,9 @@ How it works:
 
 - The ground is rebuilt the way the KO client draws it: each 4 m tile has a base texture plus, on transition tiles, an overlay texture that is added on top (that's how grass fades into dirt), and each layer can be flipped or rotated.
 - Textures keep KO's scale: at true size one KO tile covers 4 x 4 blocks, so every block shows its own 32 x 32 pixel piece of the tile.
-- A map has thousands of different pieces, but a resource pack can only add about 800 new block looks (as *note block states*: instrument + note). Similar pieces are grouped and each group uses the real KO piece closest to the group's average.
-- Minecraft derives a note block's instrument from the block beneath it, so the matching block (stone, sand, wool...) is placed right under each textured block. That way the ground keeps its texture when you build next to it. Right-clicking a textured block changes its note, so it's best for exploring rather than survival.
+- A map has thousands of different pieces, but a resource pack can only add 750 new ground looks (as *note block states*: instrument + note). Similar pieces are grouped and each group uses the real KO piece closest to the group's average.
+- Minecraft derives a note block's instrument from the block beneath it, so the matching block (netherrack, concrete powder, wool...) is placed right under each textured block. That way the ground keeps its texture when you build next to it. Right-clicking a textured block changes its note, so it's best for exploring rather than survival (the server plugin stops that).
+- Those instrument blocks show on the sides of terraces, so ground textures that look alike share an instrument, and the pack gives the instrument block that group's look. Terrace sides then match the ground above them.
 
 ## Previews
 

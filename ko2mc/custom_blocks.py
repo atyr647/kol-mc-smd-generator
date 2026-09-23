@@ -7,9 +7,9 @@ converted world uses them:
 
   ground   note block states (instrument + note); the block underneath keeps the
            instrument stable (see ko_textures.py)
-  solid    ~500 full-cube states: rarely used decorative blocks (glazed
-           terracotta, mushroom blocks, wool, ores, stone variants...) plus the
-           mob-head note block instruments
+  solid    ~1000 full-cube states: rarely used decorative blocks (glazed
+           terracotta, mushroom blocks, wool, ores, stone variants, chiseled
+           bookshelves, barrels, beehives...) plus the mob-head note block instruments
   foliage  leaf states (see-through like leaves, but with KO leaf textures)
   plant    tripwire states drawn as crossed plant sprites (KO grass and flowers)
   stairs / slab   stairs and slab block types re-textured with KO step textures
@@ -61,6 +61,35 @@ AXIS_HOSTS = ([f"{w}_wood" for w in ("oak", "spruce", "birch", "jungle", "acacia
                  "basalt", "polished_basalt", "quartz_pillar", "purpur_pillar", "muddy_mangrove_roots"])
 GLAZED_HOSTS = [f"{c}_glazed_terracotta" for c in COLORS]
 MUSHROOM_HOSTS = ["brown_mushroom_block", "red_mushroom_block", "mushroom_stem"]
+# Blocks with a few properties that never change on their own in a static world
+# (the server plugin stops players from opening/filling them).
+PROP_HOSTS = {
+    "chiseled_bookshelf": {"facing": ("north", "south", "west", "east"),
+                           **{f"slot_{i}_occupied": ("false", "true") for i in range(6)}},
+    "beehive": {"facing": ("north", "south", "west", "east"), "honey_level": tuple(str(i) for i in range(6))},
+    "bee_nest": {"facing": ("north", "south", "west", "east"), "honey_level": tuple(str(i) for i in range(6))},
+    "barrel": {"facing": ("north", "east", "south", "west", "up", "down"), "open": ("false", "true")},
+    "dispenser": {"facing": ("north", "east", "south", "west", "up", "down"), "triggered": ("false", "true")},
+    "dropper": {"facing": ("north", "east", "south", "west", "up", "down"), "triggered": ("false", "true")},
+    "target": {"power": tuple(str(i) for i in range(16))},
+    "furnace": {"facing": ("north", "south", "west", "east"), "lit": ("false", "true")},
+    "smoker": {"facing": ("north", "south", "west", "east"), "lit": ("false", "true")},
+    "blast_furnace": {"facing": ("north", "south", "west", "east"), "lit": ("false", "true")},
+    "loom": {"facing": ("north", "south", "west", "east")},
+    "redstone_lamp": {"lit": ("false", "true")},
+    "jukebox": {"has_record": ("false", "true")},
+    "podzol": {"snowy": ("false", "true")},
+    "mycelium": {"snowy": ("false", "true")},
+    "infested_deepslate": {"axis": ("x", "y", "z")},
+}
+# more single-state cubes (after the ones above in priority: some have a light or a tool GUI)
+EXTRA_SINGLE_HOSTS = [
+    "dead_tube_coral_block", "dead_brain_coral_block", "dead_bubble_coral_block", "dead_fire_coral_block",
+    "dead_horn_coral_block", "infested_stone", "infested_cobblestone", "infested_stone_bricks",
+    "infested_mossy_stone_bricks", "infested_cracked_stone_bricks", "infested_chiseled_stone_bricks",
+    "wet_sponge", "melon", "soul_soil", "crimson_nylium", "warped_nylium", "sculk",
+    "cartography_table", "fletching_table", "smithing_table", "crafting_table",
+]
 MOB_INSTRUMENTS = ["zombie", "skeleton", "creeper", "dragon", "wither_skeleton", "piglin", "custom_head"]
 
 LEAF_HOSTS = ["oak_leaves", "spruce_leaves", "birch_leaves", "jungle_leaves", "acacia_leaves",
@@ -105,6 +134,11 @@ def solid_slots():
     for b in MUSHROOM_HOSTS:
         for d in _combos({s: ("true", "false") for s in ("down", "east", "north", "south", "up", "west")}):
             out.append((_state(b, d), b, [_key(d)]))
+    for b in EXTRA_SINGLE_HOSTS:
+        out.append((_state(b, {}), b, [""]))
+    for b, props in PROP_HOSTS.items():
+        for d in _combos(props):
+            out.append((_state(b, d), b, [_key(d)]))
     for inst in MOB_INSTRUMENTS:
         for note in range(25):
             ks = [f"instrument={inst},note={note},powered={p}" for p in ("false", "true")]
@@ -131,18 +165,24 @@ def plant_slots():
 
 def host_blocks() -> set[str]:
     """Every block whose look is replaced (for the server plugin)."""
-    return (set(SINGLE_HOSTS) | set(GLAZED_HOSTS) | set(AXIS_HOSTS) | set(MUSHROOM_HOSTS)
+    return (set(SINGLE_HOSTS) | set(EXTRA_SINGLE_HOSTS) | set(PROP_HOSTS) | set(GLAZED_HOSTS) | set(AXIS_HOSTS) | set(MUSHROOM_HOSTS)
             | set(LEAF_HOSTS) | {"note_block", "tripwire"}
             | {f"{t}_stairs" for t in STAIR_SLAB_TYPES} | {f"{t}_slab" for t in STAIR_SLAB_TYPES})
 
 
+# instrument blocks under KO ground blocks that have more than one state
+UNDER_STATES = {"bone_block", "hay_block"}
+
+
 def all_block_states(host: str) -> list[str]:
     """All blockstate variant keys of a host block (for a complete blockstates file)."""
-    if host in SINGLE_HOSTS:
+    if host in SINGLE_HOSTS or host in EXTRA_SINGLE_HOSTS:
         return [""]
+    if host in PROP_HOSTS:
+        return [_key(d) for d in _combos(PROP_HOSTS[host])]
     if host in GLAZED_HOSTS:
         return [f"facing={f}" for f in ("north", "south", "east", "west")]
-    if host in AXIS_HOSTS:
+    if host in AXIS_HOSTS or host in UNDER_STATES:
         return [f"axis={a}" for a in ("x", "y", "z")]
     if host in MUSHROOM_HOSTS:
         return [_key(d) for d in _combos({s: ("true", "false") for s in ("down", "east", "north", "south", "up", "west")})]
