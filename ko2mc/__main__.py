@@ -51,6 +51,15 @@ def main():
                         help="Folder with KO Object files (.n3pmesh models + .dxt textures); "
                              "builds houses, walls and trees from the real models "
                              "(default: ./object if it exists)")
+    parser.add_argument("--ko-misc", default=None, metavar="DIR",
+                        help="KO client Misc folder (Sky/*.n3sky, river/*.dxt) for the KO sky and "
+                             "water (default: the Misc folder next to --ko-textures / --ko-models)")
+    parser.add_argument("--no-sky-colors", action="store_true",
+                        help="With the KO sky/water, keep Minecraft's normal sky/fog/water "
+                             "colours instead of KO's exact colours (skips the one-time "
+                             "'Experimental Settings' confirmation that a custom-colour world "
+                             "datapack causes when the world is opened; KO's sun, moon, clouds "
+                             "and water texture are kept either way)")
     parser.add_argument("--simple-plants", action="store_true",
                         help="With --ko-models, use single Minecraft plants for grass, flowers and "
                              "reeds instead of turning their models into blocks")
@@ -119,6 +128,8 @@ def main():
         ko_models=args.ko_models,
         simple_plants=args.simple_plants,
         vanilla_blocks=args.vanilla_blocks,
+        ko_misc=args.ko_misc,
+        sky_colors=not args.no_sky_colors,
     )
 
     if args.preview:

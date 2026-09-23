@@ -74,6 +74,9 @@ class MinecraftWorld:
         self.spawn = (0, 100, 0)
         self.player = None  # optional (x, y, z, yaw, pitch): where singleplayer starts, flying
         self.biome = "minecraft:plains"
+        self.biomes: list[str] = []          # extra biomes; biome_provider returns indices into [biome] + biomes
+        self.biome_provider = None           # (cx, cz) -> (4, 4) array [z, x] of biome indices, or None
+        self.datapack: dict[str, bytes] = {}  # world datapack "ko2mc": path inside the pack -> content
         self._pending: list[tuple[np.ndarray, ...]] = []
         self._single: list[tuple[int, int, int, int]] = []
 
@@ -188,6 +191,13 @@ class MinecraftWorld:
             self._write_region(region_dir, rx, rz, payloads)
             print(f"    region r.{rx}.{rz}.mca ({done}/{len(chunks)} chunks)")
 
+        if self.datapack:
+            root = os.path.join(self.world_dir, "datapacks", "ko2mc")
+            for path, content in self.datapack.items():
+                full = os.path.join(root, path)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "wb") as f:
+                    f.write(content)
         self._write_level_dat()
         print(f"  World saved to {self.world_dir}")
 
@@ -199,8 +209,26 @@ class MinecraftWorld:
             entry["Properties"] = props
         return entry
 
+    def _chunk_biomes(self, cx: int, cz: int) -> dict:
+        grid = self.biome_provider(cx, cz) if self.biome_provider else None
+        names = [self.biome] + self.biomes
+        if grid is None or (grid == grid.flat[0]).all():
+            return {"palette": nbt.List(nbt.TAG_STRING, [names[int(grid.flat[0]) if grid is not None else 0]])}
+        uniq, inv = np.unique(np.asarray(grid).ravel(), return_inverse=True)
+        bits = max(1, math.ceil(math.log2(len(uniq))))
+        per_long = 64 // bits
+        cells = np.tile(inv.astype(np.uint64), 4)            # 4 layers of (z, x), index = y*16 + z*4 + x
+        n_longs = math.ceil(64 / per_long)
+        padded = np.zeros(n_longs * per_long, np.uint64)
+        padded[:64] = cells
+        longs = np.bitwise_or.reduce(padded.reshape(n_longs, per_long)
+                                     << (np.arange(per_long, dtype=np.uint64) * np.uint64(bits)), axis=1)
+        return {"palette": nbt.List(nbt.TAG_STRING, [names[int(u)] for u in uniq]),
+                "data": longs.view(np.int64)}
+
     def _chunk_bytes(self, cx: int, cz: int, blocks: np.ndarray, palette_nbt) -> bytes:
         sections = []
+        biomes = self._chunk_biomes(cx, cz)
         for si in range(NUM_SECTIONS):
             sec = blocks[si * 16:(si + 1) * 16]  # (y, z, x) -> index y*256 + z*16 + x
             flat = sec.ravel()
@@ -216,7 +244,7 @@ class MinecraftWorld:
             sections.append({
                 "Y": nbt.Byte(MIN_SECTION_Y + si),
                 "block_states": states,
-                "biomes": {"palette": nbt.List(nbt.TAG_STRING, [self.biome])},
+                "biomes": biomes,
             })
         root = {
             "DataVersion": nbt.Int(MC_DATA_VERSION),
@@ -297,7 +325,9 @@ class MinecraftWorld:
                           "doMobSpawning": "false", "randomTickSpeed": "0"},
             "DragonFight": {"NeedsStateScanning": nbt.Byte(1), "DragonKilled": nbt.Byte(0),
                             "PreviouslyKilled": nbt.Byte(0)},
-            "DataPacks": {"Enabled": nbt.List(nbt.TAG_STRING, ["vanilla"]),
+            "DataPacks": {"Enabled": nbt.List(nbt.TAG_STRING, ["vanilla"] + (
+                              ["file/ko2mc"] if self.datapack or os.path.isdir(
+                                  os.path.join(self.world_dir, "datapacks", "ko2mc")) else [])),
                           "Disabled": nbt.List(nbt.TAG_STRING, [])},
             "WorldGenSettings": {
                 "seed": nbt.Long(0),

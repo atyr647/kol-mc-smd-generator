@@ -197,9 +197,15 @@ class TerrainModel:
 
         # Water level (top water block y) per column, or MIN_Y if none
         self.water_top = np.full((size, size), MIN_Y, dtype=np.int32)
+        self.water_body = np.full((size, size), -1, dtype=np.int32)   # index into water_textures
+        self.water_textures = []
         for mesh in gtd.water:
-            self._rasterize_water(mesh.triangles())
+            name = mesh.texture.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if name not in self.water_textures:
+                self.water_textures.append(name)
+            self._rasterize_water(mesh.triangles(), self.water_textures.index(name))
         self.water_top[self.water_top <= self.top] = MIN_Y
+        self.water_body[self.water_top <= self.top] = -1
 
         # Block ids per material
         mats = [materials.MATERIALS[m] for m in names]
@@ -257,7 +263,7 @@ class TerrainModel:
         if missing:
             print(f"  Missing: {', '.join(missing[:12])}{' ...' if len(missing) > 12 else ''}")
 
-    def _rasterize_water(self, tris_ko: np.ndarray):
+    def _rasterize_water(self, tris_ko: np.ndarray, body: int = -1):
         cm = self.cm
         size = cm.size_blocks
         xs = cm.x(tris_ko[:, :, 0])
@@ -280,7 +286,9 @@ class TerrainModel:
             inside = (w1 >= -1e-6) & (w2 >= -1e-6) & (w3 >= -1e-6)
             level = np.floor(w1 * ay + w2 * by + w3 * cy).astype(np.int32)
             region = self.water_top[j0:j1 + 1, i0:i1 + 1]
-            np.maximum(region, np.where(inside, level, MIN_Y), out=region)
+            new = np.where(inside, level, MIN_Y)
+            self.water_body[j0:j1 + 1, i0:i1 + 1][inside & (new >= region)] = body
+            np.maximum(region, new, out=region)
 
     def fill_chunk(self, cx: int, cz: int, out: np.ndarray):
         size = self.cm.size_blocks
@@ -900,13 +908,67 @@ def voxelize_models(opd: OPDFile, terrain: TerrainModel, world: MinecraftWorld, 
     return len(win), built
 
 
+def _find_misc(*dirs):
+    from .ko_sky import find_misc
+    try:
+        return find_misc(*dirs)
+    except OSError:
+        return None
+
+
+def _add_sky_and_water(gtd_path, misc, terrain, world, pack, sky_colors=True):
+    """KO sky colours, sun, moon, clouds and water (see ko_sky.py). Returns the .n3sky used."""
+    from . import ko_sky
+    from .ko_textures import read_n3_textures
+    map_name = os.path.splitext(os.path.basename(gtd_path))[0]
+    sky_path = ko_sky.find_sky(misc, map_name)
+    sky = ko_sky.KOSky(sky_path) if sky_path else None
+    if sky:
+        pack.extra.update(ko_sky.sky_pack_files(sky, misc))
+    # water textures, most used first
+    counts = np.bincount(terrain.water_body[terrain.water_body >= 0].ravel(),
+                         minlength=len(terrain.water_textures))
+    order = [int(i) for i in np.argsort(-counts) if counts[i] > 0]
+    water = {}
+    for i in order:
+        name = terrain.water_textures[i]
+        path = ko_sky._file(misc, f"river/{name}")
+        texs = read_n3_textures(open(path, "rb").read()) if path else None
+        if texs:
+            water[name] = texs[0].rgba
+    files, tints = ko_sky.water_pack_files(water)
+    pack.extra.update(files)
+    colour_note = "off (--no-sky-colors)"
+    if sky_colors:
+        data, ids = ko_sky.datapack(map_name, sky, tints)
+        world.datapack = data
+        world.biome, world.biomes = ids[0], ids[1:]
+        # biome index per water texture: order of `tints` (= most used first)
+        remap = np.full(len(terrain.water_textures) + 1, -1, np.int32)
+        for bi, name in enumerate(tints):
+            remap[terrain.water_textures.index(name)] = bi
+        body = np.where(terrain.water_body >= 0, remap[terrain.water_body], -1)
+        grid = ko_sky.biome_grid(body, len(ids))
+
+        def provider(cx, cz):
+            g = grid[cz * 4:cz * 4 + 4, cx * 4:cx * 4 + 4]
+            return g if g.shape == (4, 4) else None
+        world.biome_provider = provider
+        colour_note = (f"sky {sky.color('sky')}, fog {sky.color('fog')}" if sky else "no .n3sky found")
+    print(f"  KO sky: {os.path.basename(sky_path) if sky_path else 'none found'} ({colour_note}); "
+          f"KO sun/moon/clouds + water texture: {'yes' if sky else 'no sky file'}; "
+          f"KO water colours: {', '.join(tints) if (sky_colors and tints) else 'off'}")
+    return sky_path
+
+
 def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                 world_name: str = "KnightOnline", scale: int = 4,
                 vertical_scale: float | None = None, objects: bool = True,
                 buildings: bool = True, ko_textures: str | None = None,
                 pack_resolution: int = 32, pack_brightness: float = 1.3,
                 ko_models: str | None = None, simple_plants: bool = False,
-                vanilla_blocks: bool = False) -> str:
+                vanilla_blocks: bool = False, ko_misc: str | None = None,
+                sky_colors: bool = True) -> str:
     """Convert KO map files to a Minecraft world.
 
     Args:
@@ -927,6 +989,14 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
         simple_plants: With models, still use single Minecraft plants for grass/flowers/reeds.
         vanilla_blocks: Build objects from normal Minecraft blocks picked by colour instead
             of KO-textured blocks from the resource pack.
+        ko_misc: The KO client's Misc folder (Sky/*.n3sky, river/*.dxt) for the KO sky and
+            water. Default: found next to ko_textures / ko_models.
+        sky_colors: With ko_misc, also give the world KO's exact sky/fog/water colours via a
+            small world datapack (custom biomes). This makes Minecraft show a one-time
+            "Worlds using Experimental Settings" confirmation when the world is opened (any
+            datapack that adds biome colours does this; it's harmless, just click through it).
+            False keeps the KO sun, moon, clouds and water texture (no confirmation needed)
+            but leaves sky/fog/water at Minecraft's normal colours.
 
     Returns:
         Path to the generated world directory.
@@ -994,6 +1064,13 @@ def convert_map(gtd_path: str, opd_path: str | None, output_dir: str,
                      int(cm.z(s.position.z)) + 3)
     sx, sy, sz = spawn
     world.spawn = (sx, max(sy or 0, terrain.top_at(sx, sz) + 2), sz)
+
+    misc = ko_misc or _find_misc(ko_textures, ko_models)
+    if misc:
+        if pack is None:
+            from .ko_textures import TexturePack
+            pack = TexturePack(world_name, pack_resolution, pack_brightness)
+        _add_sky_and_water(gtd_path, misc, terrain, world, pack, sky_colors)
 
     print("\nSaving Minecraft world...")
     world.save()

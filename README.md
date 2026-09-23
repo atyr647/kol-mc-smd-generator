@@ -52,6 +52,7 @@ python -m ko2mc --preview gtd/moradon.gtd
 | `--ko-textures DIR` | Folder with KO `.gtt` files (default: `dtex/` if it has any) |
 | `--pack-resolution` | Pixels per block in the texture pack (default 32, KO's own detail) |
 | `--pack-brightness` | Brightness multiplier for KO textures (default 1.3) |
+| `--ko-misc DIR` | KO client `Misc` folder for the KO sky and water (default: next to `--ko-textures` / `--ko-models`) |
 | `--texture-map FILE` | JSON of extra `"texture regex": "block"` rules |
 | `--preview` | Also render the previews |
 
@@ -127,6 +128,18 @@ How it works:
 - Minecraft derives a note block's instrument from the block beneath it, so the matching block (netherrack, concrete powder, wool...) is placed right under each textured block. That way the ground keeps its texture when you build next to it. Right-clicking a textured block changes its note, so it's best for exploring rather than survival (the server plugin stops that).
 - Those instrument blocks show on the sides of terraces, so ground textures that look alike share an instrument, and the pack gives the instrument block that group's look. Terrace sides then match the ground above them.
 
+## KO sky and water
+
+With the KO client's `Misc` folder (found next to `--ko-textures` / `--ko-models`, or set with `--ko-misc`), the world also gets the map's KO sky and water:
+
+- **Sun, moon and clouds**: the resource pack swaps Minecraft's sun, moon phases and clouds for KO's sun disk and glow, KO's moon (8 of its 24 phases) and KO's puffy cloud layer. This part always applies, no confirmation needed.
+- **Water** uses KO's water texture, animated by scrolling like KO does.
+- **Sky, fog and water colours** come from the map's `Misc/Sky/<map>.n3sky` (KO's noon sky overhead, KO's fog at the horizon) and each KO water texture's own colour (sea, lake, pond...), through custom biomes in a small datapack inside the world (`datapacks/ko2mc`). Minecraft darkens it at night by itself.
+
+Vanilla Minecraft can't draw a textured sky dome, so KO's cloud layers become Minecraft's blocky clouds, and the sky is a colour gradient rather than a dome.
+
+**The one-time confirmation:** a world datapack that gives biomes custom colours makes Minecraft show a "Worlds using Experimental Settings" screen the first time you open that world (every custom-colour map/adventure map does this — it's Minecraft's standard warning for *any* datapack that touches biome colours, not a sign anything is wrong). Click "I know what I'm doing!" and play normally. If you'd rather skip that screen, add `--no-sky-colors`: you keep KO's real sun, moon, clouds and water texture, just with Minecraft's normal sky/fog/water colours instead of KO's exact ones.
+
 ## Previews
 
 ```bash
@@ -168,6 +181,7 @@ ko2mc/
   ko_models.py    - .n3pmesh model reader
   ko_objects.py   - models -> KO-textured blocks, plant sprites, steps
   ko_ground.py    - KO ground (base + overlay textures) for the pack
+  ko_sky.py       - KO sky, sun, moon, clouds and water (pack + biomes)
   custom_blocks.py - which block states carry KO textures
   nbt.py          - NBT reader/writer
   mca_reader.py   - reads worlds back for previews

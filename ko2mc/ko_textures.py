@@ -212,10 +212,11 @@ class TexturePack:
         self.plants: list[tuple[np.ndarray, int]] = []
         self.stairs: dict[str, np.ndarray] = {}
         self.slabs: dict[str, np.ndarray] = {}
+        self.extra: dict[str, bytes] = {}         # other pack files (KO sky, water; see ko_sky.py)
 
     @property
     def empty(self) -> bool:
-        return not (self.images or self.solid or self.foliage or self.plants)
+        return not (self.images or self.solid or self.foliage or self.plants or self.extra)
 
     # ---- ground ----
     def add(self, rgba: np.ndarray, label: str, slot: int | None = None) -> int | None:
@@ -381,6 +382,7 @@ class TexturePack:
                     variants.setdefault(k, fallback)
             files[f"assets/minecraft/blockstates/{host}.json"] = json.dumps({"variants": variants})
 
+        files.update(self.extra)
         files["pack.mcmeta"] = json.dumps({"pack": {
             "pack_format": PACK_FORMAT,
             "description": f"Knight Online textures for {self.title} (ko2mc)"}}, indent=2)
