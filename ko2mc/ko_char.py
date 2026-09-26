@@ -443,22 +443,20 @@ def skin_positions(skin: N3Skin, inv_bind: list, world: list) -> np.ndarray:
 # server side is expected to render each voxel as a small scaled/positioned
 # block-display entity (Minecraft 1.19.4+), not a placed world block.
 
-def load_character(chr_path: str, item_dir: str, chr_dir: str | None = None):
-    """Load a `.n3chr` + its skeleton + every body part's skin+texture.
-    Returns (character, skeleton, parts) where parts is a list of
-    (N3Skin (best LOD), texture_rgba, N3CPart)."""
+def load_parts(item_dir: str, part_names: list[str]):
+    """Load body parts (skin+texture) given `.n3cpart` base names (no
+    extension, no directory). Shared by `load_character` (names come from a
+    `.n3chr`'s part_refs) and `load_character_from_looks` (names come from
+    NPC_Looks.tbl's Part1..13 columns -- NPCs have no `.n3chr` manifest at
+    all: the client assembles them directly from a JointFile + a fixed list
+    of part files, one row per distinct "look").
+    Returns a list of (N3Skin (best LOD), texture_rgba, N3CPart)."""
     import os
-    chr_dir = chr_dir or os.path.dirname(chr_path)
-    data = open(chr_path, "rb").read()
-    ch = parse_n3chr(data)
-    joint_name = ch.joint_ref.split("\\")[-1]
-    skel = parse_n3joint(open(os.path.join(chr_dir, joint_name), "rb").read())
 
     from .ko_textures import read_n3_textures
 
     parts = []
-    for part_ref in ch.part_refs:
-        base = part_ref.split("\\")[-1].rsplit(".", 1)[0]
+    for base in part_names:
         cpart_path = os.path.join(item_dir, base + ".n3cpart")
         cskins_path = os.path.join(item_dir, base + ".n3cskins")
         if not (os.path.exists(cpart_path) and os.path.exists(cskins_path)):
@@ -476,7 +474,34 @@ def load_character(chr_path: str, item_dir: str, chr_dir: str | None = None):
         else:
             tex_rgba = np.full((4, 4, 4), 200, np.uint8)
         parts.append((lod, tex_rgba, part))
+    return parts
+
+
+def load_character(chr_path: str, item_dir: str, chr_dir: str | None = None):
+    """Load a `.n3chr` + its skeleton + every body part's skin+texture.
+    Returns (character, skeleton, parts) where parts is a list of
+    (N3Skin (best LOD), texture_rgba, N3CPart)."""
+    import os
+    chr_dir = chr_dir or os.path.dirname(chr_path)
+    data = open(chr_path, "rb").read()
+    ch = parse_n3chr(data)
+    joint_name = ch.joint_ref.split("\\")[-1]
+    skel = parse_n3joint(open(os.path.join(chr_dir, joint_name), "rb").read())
+    part_names = [ref.split("\\")[-1].rsplit(".", 1)[0] for ref in ch.part_refs]
+    parts = load_parts(item_dir, part_names)
     return ch, skel, parts
+
+
+def load_character_from_looks(joint_path: str, item_dir: str, part_names: list[str]):
+    """Load an NPC "look" the way the client actually assembles one: NPCs have
+    no `.n3chr` manifest, just a JointFile + a fixed Part1..13 list, both read
+    straight from NPC_Looks.tbl (see ko-tools/data-export's NPC voxel-model
+    exporter). Returns (skeleton, parts) -- same parts shape as
+    `load_character`.
+    """
+    skel = parse_n3joint(open(joint_path, "rb").read())
+    parts = load_parts(item_dir, part_names)
+    return skel, parts
 
 
 def posed_triangle_soup(skel: Skeleton, parts: list):
