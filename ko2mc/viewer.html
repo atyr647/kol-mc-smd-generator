@@ -500,6 +500,49 @@ async function buildMC(progress) {
   }
 }
 
+// Real KO mob/NPC voxel bodies (see kol-mc-smd-generator's ko2mc/ko_char.py
+// and the ko-world plugin's VoxelMobRig -- this draws the exact same boxes
+// that plugin renders as BlockDisplay entities on a live server, just as one
+// merged mesh instead of one entity per box).
+function buildEntities() {
+  if (!DATA.entities || !DATA.entities.length) return;
+  const pos = [], col = [];
+  const CUBE_V = [
+    [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 0, 0], [1, 1, 0], [0, 1, 0], // -Z
+    [1, 0, 1], [0, 0, 1], [0, 1, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1], // +Z
+    [0, 0, 1], [0, 0, 0], [0, 1, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1], // -X
+    [1, 0, 0], [1, 0, 1], [1, 1, 1], [1, 0, 0], [1, 1, 1], [1, 1, 0], // +X
+    [0, 1, 0], [1, 1, 0], [1, 1, 1], [0, 1, 0], [1, 1, 1], [0, 1, 1], // +Y
+    [0, 0, 1], [1, 0, 1], [1, 0, 0], [0, 0, 1], [1, 0, 0], [0, 0, 0], // -Y
+  ];
+  for (const ent of DATA.entities) {
+    for (const b of ent.boxes) {
+      const [bx, by, bz, sx, sy, sz, r, g, bl] = b;
+      for (const [vx, vy, vz] of CUBE_V) {
+        pos.push(bx + vx * sx, by + vy * sy, bz + vz * sz);
+        col.push(r, g, bl);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pos), 3));
+  geo.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(col), 3, true));
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+  mcScene.add(mesh);
+  // Floating name tags above each entity, KO-server-name-plate style.
+  for (const ent of DATA.entities) {
+    if (!ent.label) continue;
+    const div = document.createElement("div");
+    div.className = "tag";
+    div.textContent = ent.label;
+    div.dataset.wx = ent.tagPos[0]; div.dataset.wy = ent.tagPos[1]; div.dataset.wz = ent.tagPos[2];
+    $("labels").appendChild(div);
+    entityTags.push(div);
+  }
+}
+const entityTags = [];
+
 function faceAO(V, opaque, i, y, j, F) {
   // Minecraft-style smooth lighting: darken corners next to solid blocks.
   const n = F.n;
@@ -562,6 +605,22 @@ function overview() {
   const cy = KO ? koHeightAt(centerX, centerZ) : 80;
   orbit.target.set(centerX, cy, centerZ);
   camera.position.set(centerX - size * 0.15, cy + size * 0.55, centerZ + size * 0.6);
+  orbit.update();
+}
+function focusOnEntities() {
+  if (!DATA.entities || !DATA.entities.length) return;
+  if (fly.isLocked) fly.unlock();
+  let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, minZ = 1e9, maxZ = -1e9;
+  for (const ent of DATA.entities) for (const b of ent.boxes) {
+    const [bx, by, bz, sx, sy, sz] = b;
+    minX = Math.min(minX, bx); maxX = Math.max(maxX, bx + sx);
+    minY = Math.min(minY, by); maxY = Math.max(maxY, by + sy);
+    minZ = Math.min(minZ, bz); maxZ = Math.max(maxZ, bz + sz);
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+  const span = Math.max(maxX - minX, maxZ - minZ, 20);
+  orbit.target.set(cx, cy, cz);
+  camera.position.set(cx - span * 0.55, cy + span * 0.65, cz + span * 0.75);
   orbit.update();
 }
 function playerView() {
@@ -628,6 +687,20 @@ function updateLabels(vpX, vpW, show) {
   });
 }
 
+function updateEntityTags(vpX, vpW, show) {
+  if (!entityTags.length) return;
+  const v = new THREE.Vector3();
+  entityTags.forEach((el) => {
+    v.set(+el.dataset.wx, +el.dataset.wy, +el.dataset.wz).project(camera);
+    const ok = show && v.z < 1 && Math.abs(v.x) < 1 && Math.abs(v.y) < 1;
+    el.style.display = ok ? "block" : "none";
+    if (ok) {
+      el.style.left = (vpX + (v.x + 1) / 2 * vpW) + "px";
+      el.style.top = ((1 - v.y) / 2 * window.innerHeight) + "px";
+    }
+  });
+}
+
 // ---------------------------------------------------------------- main loop
 const clock = new THREE.Clock();
 const sideLabels = [document.createElement("div"), document.createElement("div")];
@@ -668,6 +741,7 @@ function frame() {
     sideLabels[0].style.left = (W / 4 - 40) + "px";
     sideLabels[1].style.left = (W * 3 / 4 - 30) + "px";
     updateLabels(0, W / 2, true);
+    updateEntityTags(W / 2, W / 2, true);
   } else {
     camera.aspect = W / H;
     camera.updateProjectionMatrix();
@@ -675,6 +749,7 @@ function frame() {
     renderer.render(mode === "ko" ? koScene : mcScene, camera);
     sideLabels[0].style.display = sideLabels[1].style.display = "none";
     updateLabels(0, W, mode === "ko");
+    updateEntityTags(0, W, mode === "mc");
   }
   const p = camera.position;
   let s = `Minecraft  x ${Math.floor(p.x)}  y ${Math.floor(p.y - 1.62)}  z ${Math.floor(p.z)}`;
@@ -726,6 +801,11 @@ function frame() {
         "Textures: plain colours. Re-run the preview with <kbd>--download-textures</kbd> or <kbd>--mc-jar</kbd> to see real Minecraft textures.";
       await buildMC((f, faces) => { $("loading").textContent = `Building Minecraft blocks... ${Math.round(f * 100)}%`; });
       $("info").innerHTML += `<br>${MC.W}x${MC.D} columns, x ${MC.x0}..${MC.x0 + MC.W - 1}, z ${MC.z0}..${MC.z0 + MC.D - 1}`;
+      buildEntities();
+      if (DATA.entities && DATA.entities.length) {
+        $("info").innerHTML += `<br>${DATA.entities.length} mob/NPC voxel bodies placed at real KO spawn data`;
+        focusOnEntities();
+      }
     }
     $("loading").style.display = "none";
     window.VIEWER_READY = true;

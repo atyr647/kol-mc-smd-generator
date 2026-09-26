@@ -548,10 +548,11 @@ class MCScene:
 # Output
 # ---------------------------------------------------------------------------
 
-def write_viewer(path: str, title: str, ko: dict | None, mc: dict | None):
+def write_viewer(path: str, title: str, ko: dict | None, mc: dict | None, entities: list | None = None):
     with open(VIEWER_TEMPLATE, encoding="utf-8") as f:
         html = f.read()
-    data = json.dumps({"title": title, "ko": ko, "mc": mc}, separators=(",", ":"))
+    data = json.dumps({"title": title, "ko": ko, "mc": mc, "entities": entities},
+                       separators=(",", ":"))
     html = html.replace("/*__TITLE__*/", title).replace("\"__DATA__\"", data)
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
