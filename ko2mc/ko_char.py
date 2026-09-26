@@ -480,18 +480,37 @@ def load_character(chr_path: str, item_dir: str, chr_dir: str | None = None):
 
 
 def posed_triangle_soup(skel: Skeleton, parts: list):
-    """Bind-pose (frame 0) world-space triangles + UVs + texture per part.
+    """Bind-pose (frame 0) world-space triangles + UVs + texture per part, in
+    the SAME right-handed KO-metre space ko_models.py/converter.py already use
+    for buildings and terrain (KO itself is DirectX: left-handed, Y-up).
     Returns a list of (tris (F,3,3), uvs (F,3,2), tex_rgba) -- the same shape
-    ko_models.py's sample_part / qa_render.py's ko_mesh already consume."""
+    ko_models.py's sample_part / qa_render.py's ko_mesh already consume.
+
+    The handedness fix is negating Z (positions) and reversing each triangle's
+    winding -- matching converter.py's CoordMap.z() (`map_size_m - ko_z`, the
+    same negation) and webmmoproj's toThree.ts (same fix, independently
+    documented: "Knight Online is a DirectX engine: LEFT-handed, Y-up. We
+    convert by negating Z ... and reversing triangle winding"). NOT negating
+    X: an earlier throwaway render script in this session did that instead,
+    which was wrong by this same precedent -- harmless-looking on these
+    mostly-symmetric mobs, but the wrong axis regardless.
+    """
     world, inv = bind_matrices(skel)
     out = []
     for lod, tex_rgba, _part in parts:
         posed = skin_positions(lod, inv, world)
+        posed = posed.copy()
+        posed[:, 2] *= -1
         mesh = lod.mesh
         if mesh.face_count == 0 or mesh.uv_count == 0:
             continue
         vidx = mesh.vertex_indices.reshape(-1, 3).astype(np.int64)
         uvidx = mesh.uv_indices.reshape(-1, 3).astype(np.int64)
+        # Reverse winding (swap the last two corners) to keep faces front-facing
+        # after the Z mirror -- irrelevant to the voxelizer's own occupancy
+        # sampling, but keeps this geometry correct for any face-culled renderer.
+        vidx[:, [1, 2]] = vidx[:, [2, 1]]
+        uvidx[:, [1, 2]] = uvidx[:, [2, 1]]
         tris = posed[vidx].astype(np.float32)
         uvs = mesh.uvs[uvidx].astype(np.float32)
         out.append((tris, uvs, tex_rgba))
