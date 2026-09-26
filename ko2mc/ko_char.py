@@ -433,3 +433,115 @@ def skin_positions(skin: N3Skin, inv_bind: list, world: list) -> np.ndarray:
             acc += t * w
         out[i] = acc
     return out
+
+
+# --- micro-voxel model builder ----------------------------------------------
+# A mob's whole body is ~1-4m tall, so a real Minecraft block (1m) is far too
+# coarse to be recognizable -- unlike buildings, a mob needs a MUCH finer grid
+# (a handful of centimeters per voxel), so this is expressed as fractional
+# offsets within a single block rather than one Minecraft block per voxel; the
+# server side is expected to render each voxel as a small scaled/positioned
+# block-display entity (Minecraft 1.19.4+), not a placed world block.
+
+def load_character(chr_path: str, item_dir: str, chr_dir: str | None = None):
+    """Load a `.n3chr` + its skeleton + every body part's skin+texture.
+    Returns (character, skeleton, parts) where parts is a list of
+    (N3Skin (best LOD), texture_rgba, N3CPart)."""
+    import os
+    chr_dir = chr_dir or os.path.dirname(chr_path)
+    data = open(chr_path, "rb").read()
+    ch = parse_n3chr(data)
+    joint_name = ch.joint_ref.split("\\")[-1]
+    skel = parse_n3joint(open(os.path.join(chr_dir, joint_name), "rb").read())
+
+    from .ko_textures import read_n3_textures
+
+    parts = []
+    for part_ref in ch.part_refs:
+        base = part_ref.split("\\")[-1].rsplit(".", 1)[0]
+        cpart_path = os.path.join(item_dir, base + ".n3cpart")
+        cskins_path = os.path.join(item_dir, base + ".n3cskins")
+        if not (os.path.exists(cpart_path) and os.path.exists(cskins_path)):
+            continue
+        part = parse_n3cpart(open(cpart_path, "rb").read())
+        skins = parse_n3skins(open(cskins_path, "rb").read())
+        lod = next((l for l in skins.lods if l.mesh.vertex_count > 0 and l.mesh.face_count > 0), None)
+        if lod is None:
+            continue
+        tex_name = part.texture_ref.split("\\")[-1]
+        tex_path = os.path.join(item_dir, tex_name)
+        if os.path.exists(tex_path):
+            texs = read_n3_textures(open(tex_path, "rb").read())
+            tex_rgba = texs[0].rgba if texs else np.full((4, 4, 4), 200, np.uint8)
+        else:
+            tex_rgba = np.full((4, 4, 4), 200, np.uint8)
+        parts.append((lod, tex_rgba, part))
+    return ch, skel, parts
+
+
+def posed_triangle_soup(skel: Skeleton, parts: list):
+    """Bind-pose (frame 0) world-space triangles + UVs + texture per part.
+    Returns a list of (tris (F,3,3), uvs (F,3,2), tex_rgba) -- the same shape
+    ko_models.py's sample_part / qa_render.py's ko_mesh already consume."""
+    world, inv = bind_matrices(skel)
+    out = []
+    for lod, tex_rgba, _part in parts:
+        posed = skin_positions(lod, inv, world)
+        mesh = lod.mesh
+        if mesh.face_count == 0 or mesh.uv_count == 0:
+            continue
+        vidx = mesh.vertex_indices.reshape(-1, 3).astype(np.int64)
+        uvidx = mesh.uv_indices.reshape(-1, 3).astype(np.int64)
+        tris = posed[vidx].astype(np.float32)
+        uvs = mesh.uvs[uvidx].astype(np.float32)
+        out.append((tris, uvs, tex_rgba))
+    return out
+
+
+def voxelize_character(parts, voxel_size: float = 0.08):
+    """Surface-sample every part's posed triangles and bucket samples into a
+    voxel grid (grid units = `voxel_size` metres each -- KO's own units, same
+    ones the posed positions are already in). Overlapping parts (elbows,
+    collars, ...) just average into the same cell, matching how the rest of
+    this codebase treats ambiguous multi-surface samples.
+
+    Returns {(vx, vy, vz): (r, g, b)} -- integer grid indices, average RGB.
+    """
+    from .ko_models import sample_part
+
+    sums: dict[tuple, np.ndarray] = {}
+    counts: dict[tuple, int] = {}
+    for tris, uvs, tex_rgba in parts:
+        pts, _tri, tx, ty = sample_part(tris, uvs, tex_rgba, alpha_test=False, spacing=voxel_size * 0.6)
+        if len(pts) == 0:
+            continue
+        colors = tex_rgba[ty, tx, :3].astype(np.float64)
+        cells = np.floor(pts / voxel_size).astype(np.int64)
+        for cell, color in zip(map(tuple, cells), colors):
+            if cell in sums:
+                sums[cell] += color
+                counts[cell] += 1
+            else:
+                sums[cell] = color.copy()
+                counts[cell] = 1
+    return {cell: tuple((sums[cell] / counts[cell]).round().astype(int)) for cell in sums}
+
+
+def voxels_to_blocks(voxels: dict) -> dict:
+    """Map each voxel's average RGB to the nearest Minecraft block, using
+    every block ko_models.py's BLOCK_COLORS knows (not just BUILD_BLOCKS --
+    a mob's skin/fur/cloth needs wool/concrete/terracotta's much wider hue
+    range, unlike a building's stone/wood palette)."""
+    from .ko_models import BLOCK_COLORS, Palette
+
+    if not hasattr(voxels_to_blocks, "_palette"):
+        voxels_to_blocks._palette = Palette(BLOCK_COLORS)
+        voxels_to_blocks._names = list(BLOCK_COLORS)
+    palette = voxels_to_blocks._palette
+    names = voxels_to_blocks._names
+    if not voxels:
+        return {}
+    cells = list(voxels)
+    rgb = np.array([voxels[c] for c in cells], dtype=np.float64)
+    idx = palette.nearest(rgb)
+    return {cell: names[i] for cell, i in zip(cells, idx)}
