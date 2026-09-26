@@ -527,16 +527,25 @@ def voxelize_character(parts, voxel_size: float = 0.08):
     return {cell: tuple((sums[cell] / counts[cell]).round().astype(int)) for cell in sums}
 
 
+# Wool/concrete/terracotta: every hue Minecraft has, all with a flat, uniform
+# texture (no grain/rings/ore-flecks/mortar-lines) -- appropriate for an
+# organic creature's skin/fur/cloth, unlike logs, planks, bricks or ores,
+# which have a strong, distinct pattern that reads as "wrong material" up
+# close on a mob even when their average colour is a decent match.
+_MOB_BLOCK_NAMES = None
+
+
 def voxels_to_blocks(voxels: dict) -> dict:
-    """Map each voxel's average RGB to the nearest Minecraft block, using
-    every block ko_models.py's BLOCK_COLORS knows (not just BUILD_BLOCKS --
-    a mob's skin/fur/cloth needs wool/concrete/terracotta's much wider hue
-    range, unlike a building's stone/wood palette)."""
+    """Map each voxel's average RGB to the nearest flat-textured Minecraft
+    block (wool/concrete/terracotta -- see _MOB_BLOCK_NAMES)."""
+    global _MOB_BLOCK_NAMES
     from .ko_models import BLOCK_COLORS, Palette
 
+    if _MOB_BLOCK_NAMES is None:
+        _MOB_BLOCK_NAMES = [k for k in BLOCK_COLORS if k.endswith(("_wool", "_concrete", "_terracotta")) or k == "terracotta"]
     if not hasattr(voxels_to_blocks, "_palette"):
-        voxels_to_blocks._palette = Palette(BLOCK_COLORS)
-        voxels_to_blocks._names = list(BLOCK_COLORS)
+        voxels_to_blocks._palette = Palette({k: BLOCK_COLORS[k] for k in _MOB_BLOCK_NAMES})
+        voxels_to_blocks._names = _MOB_BLOCK_NAMES
     palette = voxels_to_blocks._palette
     names = voxels_to_blocks._names
     if not voxels:
